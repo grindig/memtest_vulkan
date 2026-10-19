@@ -1105,6 +1105,18 @@ impl BandwidthTracker {
         self.totals = Default::default();
         dropped
     }
+    /// Forgets the best bandwidth seen, so later intervals are compared only with each other.
+    fn reset_baselines(&mut self) {
+        for entry in self.history.values_mut() {
+            entry.best_gbps = 0.0;
+            entry.low_reports = 0;
+        }
+    }
+}
+
+/// Memory clocks more than 1% apart; smaller changes can't explain a BANDWIDTH_DROP_THRESHOLD drop.
+fn mem_clock_changed(a: u32, b: u32) -> bool {
+    a.abs_diff(b) * 100 > a.max(b)
 }
 
 /// Warning text for sustained drops, using the interval's telemetry to name the likely cause.
@@ -1130,7 +1142,7 @@ fn bandwidth_warning(
         .join(", ");
     // power/thermal limits mostly lower the core clock, so a steady memory clock still matters with them
     let cause = match telemetry.map(|t| (t.mem_clock_range(), t.throttle_names())) {
-        Some((Some((low, high)), _)) if low != high => format!(
+        Some((Some((low, high)), _)) if mem_clock_changed(low, high) => format!(
             "The memory clock varied {low}-{high}MHz in this interval, so a clock change is the likely cause."
         ),
         Some((Some((clock, _)), limits)) if !limits.is_empty() => format!(
@@ -1273,11 +1285,9 @@ fn status_row(columns: &[StatusColumn], values: &StatusValues) -> String {
             CoreTemp => telemetry
                 .and_then(|t| t.core_temperature_max())
                 .map_or_else(dash, |celsius| format!("{celsius}C")),
-            MemClock => match telemetry.and_then(|t| t.mem_clock_range()) {
-                Some((low, high)) if low != high => format!("{low}*"),
-                Some((clock, _)) => clock.to_string(),
-                None => dash(),
-            },
+            MemClock => telemetry
+                .and_then(|t| t.last().mem_clock_mhz)
+                .map_or_else(dash, |clock| clock.to_string()),
             Power => telemetry
                 .and_then(|t| t.power_max())
                 .map_or_else(dash, |watts| format!("{watts:.0}W")),
@@ -1872,6 +1882,7 @@ fn test_device<Writer: std::io::Write>(
     let first_iter_start = time::Instant::now();
     let mut last_status_output = first_iter_start;
     let mut last_error_at: Option<time::Duration> = None;
+    let mut baseline_mem_clock: Option<u32> = None; // memory clock the bandwidth baselines belong to
     let mut tested_bytes = 0f64; // written + read since the start, March traffic included
     let mut status_header_due = true;
     // The static window is written once and only re-read, which catches retention errors. It moves to
@@ -2022,10 +2033,29 @@ fn test_device<Writer: std::io::Write>(
                     },
                 ),
             };
+            // a fresh sample, so the table shows the clock as it is now, e.g. right after retuning;
+            // skipped in the first second, while NVML still reports the idle clock
+            if let Some(nvml) = &nvml
+                && first_iter_start.elapsed() >= TELEMETRY_PERIOD
+            {
+                telemetry_interval.add(nvml.sample());
+                last_telemetry_sample = time::Instant::now();
+            }
             let march_gbps = bandwidth.interval_gbps(KernelKind::March);
             let full_length_interval =
                 next_report_duration == extended_test_report_duration && !stop_testing;
             let bandwidth_drops = bandwidth.finish_interval(full_length_interval);
+            // a memory clock change, like retuning an overclock mid-test, moves bandwidth on purpose,
+            // so later reports are compared with what the new clock achieves
+            if let Some((low, high)) = telemetry_interval.mem_clock_range() {
+                let current = telemetry_interval.last().mem_clock_mhz.unwrap_or(high);
+                if mem_clock_changed(low, high)
+                    || baseline_mem_clock.is_some_and(|clock| mem_clock_changed(clock, current))
+                {
+                    bandwidth.reset_baselines();
+                }
+                baseline_mem_clock = Some(current);
+            }
             let second1 = time::Duration::from_secs(1);
             if next_report_duration.is_zero() {
                 let title = format!("Standard 5-minute test of {selected_label}");
@@ -3115,6 +3145,30 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_baselines_restart_after_a_memory_clock_change() {
+        let mut tracker = BandwidthTracker::default();
+        feed(&mut tracker, KernelKind::Read, &[700.0; 10]);
+        assert!(tracker.finish_interval(true).is_empty());
+        // a lower memory clock lowers bandwidth on purpose, which is no reason to warn
+        tracker.reset_baselines();
+        for _ in 0..3 {
+            feed(&mut tracker, KernelKind::Read, &[600.0; 10]);
+            assert!(tracker.finish_interval(true).is_empty());
+        }
+        // a real drop at the new clock is still caught
+        let mut warned = Vec::new();
+        for _ in 0..2 {
+            feed(&mut tracker, KernelKind::Read, &[550.0; 10]);
+            warned.push(!tracker.finish_interval(true).is_empty());
+        }
+        assert_eq!(warned, [false, true]);
+        assert!(!mem_clock_changed(13001, 13001));
+        assert!(!mem_clock_changed(13001, 13050)); // jitter-sized steps don't count
+        assert!(mem_clock_changed(13001, 13201)); // a +200MHz retune does
+        assert!(mem_clock_changed(13001, 405));
+    }
+
+    #[test]
     fn bandwidth_ignores_intervals_with_too_few_dispatches() {
         let mut tracker = BandwidthTracker::default();
         feed(&mut tracker, KernelKind::March, &[700.0; 10]);
@@ -3209,8 +3263,9 @@ mod tests {
     }
 
     #[test]
-    fn status_row_shows_memory_temperature_and_marks_clock_changes() {
+    fn status_row_shows_memory_temperature_and_current_clock() {
         let mut stats = telemetry::IntervalStats::default();
+        // the clock was lowered during the interval: the row shows the latest one, unmarked
         for (clock, memory, power, reasons) in
             [(13001, 72.0, 262.4, 0x4), (10501, 74.0, 250.0, 0x40)]
         {
@@ -3235,7 +3290,7 @@ mod tests {
         let columns = status_columns(true, true, true, 119);
         assert_eq!(
             status_row(&columns, &values),
-            "00:00:36  ERR 00:01:23   678.9   697.7       -   74C  10501*   262W  power,thermal    58C   12.3TiB"
+            "00:00:36  ERR 00:01:23   678.9   697.7       -   74C   10501   262W  power,thermal    58C   12.3TiB"
         );
         let quiet = StatusValues {
             last_error_at: None,

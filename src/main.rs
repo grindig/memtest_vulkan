@@ -1178,8 +1178,8 @@ enum StatusColumn {
 impl StatusColumn {
     fn layout(self) -> console::Column {
         let (header, width, left_aligned) = match self {
-            StatusColumn::Time => ("time", 8, true),
-            StatusColumn::Status => ("status", 12, true),
+            StatusColumn::Time => ("time", 12, true),
+            StatusColumn::Status => ("status", 16, true),
             StatusColumn::Write => ("write", 6, false),
             StatusColumn::Read => ("read", 6, false),
             StatusColumn::March => ("march", 6, false),
@@ -1270,10 +1270,10 @@ fn status_row(columns: &[StatusColumn], values: &StatusValues) -> String {
     let cells: Vec<String> = columns
         .iter()
         .map(|column| match column {
-            Time => values.elapsed.hhmmss(),
-            Status => values
-                .last_error_at
-                .map_or("no errors".to_owned(), |at| format!("ERR {}", at.hhmmss())),
+            Time => values.elapsed.hhmmssxxx(),
+            Status => values.last_error_at.map_or("no errors".to_owned(), |at| {
+                format!("ERR {}", at.hhmmssxxx())
+            }),
             Write => speed(values.write_gbps),
             Read => speed(values.read_gbps),
             March => values
@@ -3236,10 +3236,10 @@ mod tests {
         // without a memory sensor the core temperature takes its place
         assert_eq!(
             status_columns(false, true, false, 79),
-            [Time, Status, Write, Read, CoreTemp, MemClock, Power, Limit]
+            [Time, Status, Write, Read, CoreTemp, MemClock, Power]
         );
         assert_eq!(
-            status_columns(false, false, false, 39),
+            status_columns(false, false, false, 47),
             [Time, Status, Write, Read]
         );
         let values = StatusValues {
@@ -3290,7 +3290,7 @@ mod tests {
         let columns = status_columns(true, true, true, 119);
         assert_eq!(
             status_row(&columns, &values),
-            "00:00:36  ERR 00:01:23   678.9   697.7       -   74C   10501   262W  power,thermal    58C   12.3TiB"
+            "00:00:36.000  ERR 00:01:23.000   678.9   697.7       -   74C   10501   262W  power,thermal    58C   12.3TiB"
         );
         let quiet = StatusValues {
             last_error_at: None,
@@ -3298,7 +3298,7 @@ mod tests {
             tested_bytes: 936.0 * GB as f64,
             ..values
         };
-        assert!(status_row(&columns, &quiet).starts_with("00:00:36  no errors  "));
+        assert!(status_row(&columns, &quiet).starts_with("00:00:36.000  no errors  "));
         assert!(status_row(&columns, &quiet).ends_with("  936GiB"));
         let long_run = StatusValues {
             tested_bytes: 2.5 * 1024.0 * 1024.0 * GB as f64, // 2.5PiB in GiB
@@ -3313,14 +3313,14 @@ mod tests {
         let lines: Vec<&str> = header.lines().collect();
         assert_eq!(
             lines[0],
-            "time      status         write    read   march  memT  memMHz  power  limit          coreT    tested"
+            "time          status             write    read   march  memT  memMHz  power  limit          coreT    tested"
         );
-        assert_eq!(lines[1], format!("{}GiB/s   GiB/s   GiB/s", " ".repeat(25)));
+        assert_eq!(lines[1], format!("{}GiB/s   GiB/s   GiB/s", " ".repeat(33)));
         // each unit ends where its column header ends
         for name in ["write", "read", "march"] {
             assert!(lines[0].find(name).unwrap() + name.len() <= lines[1].len());
         }
-        assert_eq!(lines[0].find("write").unwrap() + 5, 25 + 5);
+        assert_eq!(lines[0].find("write").unwrap() + 5, 33 + 5);
     }
 
     #[test]

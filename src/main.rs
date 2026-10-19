@@ -2029,7 +2029,8 @@ fn test_device<Writer: std::io::Write>(
             let second1 = time::Duration::from_secs(1);
             if next_report_duration.is_zero() {
                 let title = format!("Standard 5-minute test of {selected_label}");
-                writeln!(log_dupler, "{}", console::wrap(&title, width))?;
+                // the empty line sets the results table apart from the startup text
+                writeln!(log_dupler, "{}\n", console::wrap(&title, width))?;
                 next_report_duration = second1; //2nd report after 1 second
             } else if next_report_duration == second1 {
                 close::raise_status_bit(close::app_status::INITED_OK);

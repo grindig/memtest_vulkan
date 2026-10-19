@@ -2846,14 +2846,11 @@ fn init_running_env() -> ProcessEnv {
         }
     }
     if process_env.interactive {
-        print!("https://github.com/GpuZelenograd/");
+        print!("https://github.com/grindig/memtest_vulkan");
         let _ = std::io::stdout().flush();
         let mut color_setter = input::Reader::default();
         color_setter.set_pass_fail_accent_color(false);
-        println!(
-            "memtest_vulkan v{} by GpuZelenograd",
-            env!("CARGO_PKG_VERSION")
-        );
+        println!(" v{} fork by grindig", env!("CARGO_PKG_VERSION"));
         drop(color_setter);
         println!("To finish testing use Ctrl+C");
     }

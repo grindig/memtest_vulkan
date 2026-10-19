@@ -29,7 +29,26 @@ To use the original test of memtest_vulkan, refer to [Settings](#settings).
 
 ## Get the program
 
-There are no releases of this fork at this time. Build the program from the source code.
+### Download
+
+Download the file for your computer from the [v0.6.0 release](https://github.com/grindig/memtest_vulkan/releases/tag/v0.6.0).
+
+| File | Use it on |
+| --- | --- |
+| `memtest_vulkan-v0.6.0.exe` | 64-bit Windows 7 or later. |
+| `memtest_vulkan-v0.6.0-alt-experimental.exe` | 64-bit Windows 10 or later. Use this file if the other `.exe` file does not start. |
+| `memtest_vulkan-v0.6.0_DesktopLinux_X86_64.tar.xz` | 64-bit Linux on x86_64 computers. |
+| `memtest_vulkan-v0.6.0_EmbeddedLinux_AARCH64.tar.xz` | 64-bit Linux on ARM computers, for example NVIDIA Jetson or Raspberry Pi 4. |
+
+The Windows files are ready to use. On Linux, extract the file before you start the program:
+
+```bash
+tar -xf memtest_vulkan-v0.6.0_DesktopLinux_X86_64.tar.xz
+```
+
+The release page also shows the SHA-256 checksums of the files.
+
+You can also build the program from the source code. Refer to the steps that follow.
 
 ### Build on Windows
 
@@ -66,7 +85,7 @@ The build makes the file `target/release/memtest_vulkan`.
 
 ## Start a test
 
-On Windows, double-click `memtest_vulkan.exe`. Administrator rights are not necessary.
+On Windows, double-click the `.exe` file. Administrator rights are not necessary.
 
 On Linux, open a terminal in the folder of the program. Then start the program:
 

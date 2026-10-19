@@ -1,4 +1,5 @@
 mod close;
+mod console;
 mod erupt_vendored_utils_loading;
 mod input;
 mod output;
@@ -576,10 +577,8 @@ impl fmt::Display for IOBuf {
         };
         writeln!(
             f,
-            "values range: {}   FFFFFFFF-like count:{}   pattern:{}    bit-level stats table:",
-            values_range,
-            self.actual_ff,
-            pattern_name(self.pattern)
+            "values range: {}  FFFFFFFF-like count:{}",
+            values_range, self.actual_ff
         )?;
         writeln!(
             f,
@@ -1149,6 +1148,174 @@ fn bandwidth_warning(
     ))
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum StatusColumn {
+    Time,
+    Status,
+    Write,
+    Read,
+    March,
+    MemTemp,
+    MemClock,
+    Power,
+    Limit,
+    CoreTemp,
+    Tested,
+}
+
+impl StatusColumn {
+    fn layout(self) -> console::Column {
+        let (header, width, left_aligned) = match self {
+            StatusColumn::Time => ("time", 8, true),
+            StatusColumn::Status => ("status", 12, true),
+            StatusColumn::Write => ("write", 6, false),
+            StatusColumn::Read => ("read", 6, false),
+            StatusColumn::March => ("march", 6, false),
+            StatusColumn::MemTemp => ("memT", 4, false),
+            StatusColumn::MemClock => ("memMHz", 6, false),
+            StatusColumn::Power => ("power", 5, false),
+            StatusColumn::Limit => ("limit", 13, true),
+            StatusColumn::CoreTemp => ("coreT", 5, false),
+            StatusColumn::Tested => ("tested", 7, false),
+        };
+        console::Column {
+            header,
+            width,
+            left_aligned,
+        }
+    }
+}
+
+/// Status-table columns this run can fill, most important first, cut to fit `width`.
+fn status_columns(
+    march: bool,
+    telemetry: bool,
+    memory_temperature: bool,
+    width: usize,
+) -> Vec<StatusColumn> {
+    use StatusColumn::*;
+    let mut columns = vec![Time, Status, Write, Read];
+    if march {
+        columns.push(March);
+    }
+    if telemetry {
+        columns.push(if memory_temperature {
+            MemTemp
+        } else {
+            CoreTemp
+        });
+        columns.extend([MemClock, Power, Limit]);
+        if memory_temperature {
+            columns.push(CoreTemp);
+        }
+    }
+    columns.push(Tested);
+    let layouts: Vec<console::Column> = columns.iter().map(|c| c.layout()).collect();
+    columns.truncate(console::fitting_columns(&layouts, width));
+    columns
+}
+
+fn status_legend(columns: &[StatusColumn], gpu_timed: bool) -> String {
+    use StatusColumn::*;
+    let speeds: Vec<&str> = columns
+        .iter()
+        .filter_map(|column| match column {
+            Write => Some("write"),
+            Read => Some("read"),
+            March => Some("march"),
+            _ => None,
+        })
+        .collect();
+    let mut parts = vec![format!(
+        "{} = GiB/s timed on the {}",
+        speeds.join("/"),
+        if gpu_timed { "GPU" } else { "CPU" }
+    )];
+    for column in columns {
+        parts.push(
+            match column {
+                MemTemp => "memT = hottest memory junction temperature",
+                CoreTemp => "coreT = hottest GPU core temperature",
+                MemClock => "memMHz = memory clock (* = it changed, lowest shown)",
+                Power => "power = highest board power",
+                Limit => "limit = power/thermal clock limiting reported by the driver",
+                Tested => "tested = data written and read so far",
+                _ => continue,
+            }
+            .to_owned(),
+        );
+    }
+    format!("Columns: {}", parts.join("; "))
+}
+
+struct StatusValues<'a> {
+    elapsed: time::Duration,
+    last_error_at: Option<time::Duration>,
+    write_gbps: f32,
+    read_gbps: f32,
+    march_gbps: Option<f64>,
+    telemetry: Option<&'a telemetry::IntervalStats>,
+    tested_bytes: f64,
+}
+
+fn status_header(columns: &[StatusColumn]) -> String {
+    let layouts: Vec<console::Column> = columns.iter().map(|c| c.layout()).collect();
+    let headers: Vec<String> = layouts.iter().map(|c| c.header.to_owned()).collect();
+    console::row(&layouts, &headers)
+}
+
+fn status_row(columns: &[StatusColumn], values: &StatusValues) -> String {
+    use StatusColumn::*;
+    let dash = || "-".to_owned();
+    let speed = |gbps: f32| {
+        if gbps > 0.0 {
+            format!("{gbps:.1}")
+        } else {
+            dash()
+        }
+    };
+    let telemetry = values.telemetry;
+    let cells: Vec<String> = columns
+        .iter()
+        .map(|column| match column {
+            Time => values.elapsed.hhmmss(),
+            Status => values
+                .last_error_at
+                .map_or("no errors".to_owned(), |at| format!("ERR {}", at.hhmmss())),
+            Write => speed(values.write_gbps),
+            Read => speed(values.read_gbps),
+            March => values
+                .march_gbps
+                .map_or_else(dash, |gbps| format!("{gbps:.1}")),
+            MemTemp => telemetry
+                .and_then(|t| t.mem_temperature_max())
+                .map_or_else(dash, |celsius| format!("{celsius:.0}C")),
+            CoreTemp => telemetry
+                .and_then(|t| t.core_temperature_max())
+                .map_or_else(dash, |celsius| format!("{celsius}C")),
+            MemClock => match telemetry.and_then(|t| t.mem_clock_range()) {
+                Some((low, high)) if low != high => format!("{low}*"),
+                Some((clock, _)) => clock.to_string(),
+                None => dash(),
+            },
+            Power => telemetry
+                .and_then(|t| t.power_max())
+                .map_or_else(dash, |watts| format!("{watts:.0}W")),
+            Limit => telemetry.map(|t| t.limit_codes()).unwrap_or_default(),
+            Tested => {
+                let gib = values.tested_bytes / GB as f64;
+                if gib < 1024.0 {
+                    format!("{gib:.0}G")
+                } else {
+                    format!("{:.1}T", gib / 1024.0)
+                }
+            }
+        })
+        .collect();
+    let layouts: Vec<console::Column> = columns.iter().map(|c| c.layout()).collect();
+    console::row(&layouts, &cells)
+}
+
 fn report_window_errors<Writer: std::io::Write>(
     log_dupler: &mut output::LogDupler<Writer>,
     buffer_out: &IOBuf,
@@ -1156,29 +1323,29 @@ fn report_window_errors<Writer: std::io::Write>(
     test_window_size: i64,
     mode: &str,
     first_iter_start: time::Instant,
-    last_error_state: &mut String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some((error_range, total_errors)) = buffer_out.get_error_addresses_and_count(test_offset)
-    {
-        *last_error_state = format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
-        close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
-        let test_elems = test_window_size / ELEMENT_SIZE;
-        write!(
-            log_dupler,
-            "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}",
-            mode,
-            total_errors,
-            test_elems,
-            total_errors as f64 / test_elems as f64 * 100.0f64,
-            error_range,
-        )?;
-        writeln!(
-            log_dupler,
-            "  iteration:{}\n{}",
-            buffer_out.iter, buffer_out
-        )?;
-    }
-    Ok(())
+    last_error_at: &mut Option<time::Duration>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some((error_range, total_errors)) = buffer_out.get_error_addresses_and_count(test_offset)
+    else {
+        return Ok(false);
+    };
+    *last_error_at = Some(first_iter_start.elapsed());
+    close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
+    let test_elems = test_window_size / ELEMENT_SIZE;
+    let summary = format!(
+        "Error found. Mode {mode}, total errors 0x{total_errors:X} out of 0x{test_elems:X} ({:2.8}%)\nErrors address range: {error_range:?}  iteration:{}  pattern:{}",
+        total_errors as f64 / test_elems as f64 * 100.0f64,
+        buffer_out.iter,
+        pattern_name(buffer_out.pattern)
+    );
+    writeln!(
+        log_dupler,
+        "{}",
+        console::wrap(&summary, console::line_width())
+    )?;
+    // the bit-level table keeps its fixed 81-column layout
+    writeln!(log_dupler, "{buffer_out}")?;
+    Ok(true)
 }
 
 fn allocate_test_windows(
@@ -1625,9 +1792,12 @@ fn test_device<Writer: std::io::Write>(
             test_mem_reqs.memory_type_bits
         );
     }
+    let width = console::line_width();
+    if env.verbose() {
+        let _ = writeln!(log_dupler, "Output width: {}", console::describe());
+    }
     if extended {
-        writeln!(
-            log_dupler,
+        let mode = format!(
             "Extended mode: {} data-pattern families, {}, retention window rotates every {}s (MEMTEST_VULKAN_MODE=classic for the original test)",
             PATTERN_FAMILY_COUNT,
             match march_every {
@@ -1636,14 +1806,22 @@ fn test_device<Writer: std::io::Write>(
                 n => format!("March C- on 1 of every {n} blocks of {PATTERN_FAMILY_COUNT} passes"),
             },
             STATIC_WINDOW_ROTATE_PERIOD.as_secs()
-        )?;
+        );
+        writeln!(log_dupler, "{}", console::wrap(&mode, width))?;
     }
     if query_pool.is_none() {
         writeln!(
             log_dupler,
-            "GPU timestamps unavailable: speeds use CPU time and bandwidth-drop detection is off"
+            "{}",
+            console::wrap(
+                "GPU timestamps unavailable: speeds use CPU time and bandwidth-drop detection is off",
+                width
+            )
         )?;
     }
+    let device_name = unsafe { CStr::from_ptr(physical_props.device_name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
     // MEMTEST_VULKAN_TELEMETRY=0 skips loading NVML
     let nvml = if physical_props.vendor_id != telemetry::NVIDIA_VENDOR_ID
         || env::var("MEMTEST_VULKAN_TELEMETRY").is_ok_and(|v| v == "0")
@@ -1655,12 +1833,17 @@ fn test_device<Writer: std::io::Write>(
             pci_bus_info.pci_bus,
             pci_bus_info.pci_device,
             pci_bus_info.pci_function,
+            &device_name,
         ) {
             Ok(nvml) => {
-                writeln!(
-                    log_dupler,
-                    "Telemetry: NVML (memory/core clock, temperature, power, clock limit reasons, ECC if enabled)"
-                )?;
+                let temperature = match nvml.memory_temperature_missing() {
+                    None => "memory junction temperature from NVAPI".to_owned(),
+                    Some(reason) => format!("core temperature instead of memory, since {reason}"),
+                };
+                let source = format!(
+                    "Telemetry: memory clock, power, clock limits and ECC from NVML; {temperature}"
+                );
+                writeln!(log_dupler, "{}", console::wrap(&source, width))?;
                 Some(nvml)
             }
             Err(e) => {
@@ -1676,6 +1859,13 @@ fn test_device<Writer: std::io::Write>(
     let mut last_telemetry_sample = time::Instant::now();
     // ECC counters only exist on GPUs with ECC enabled; any increase is a memory error the test didn't see
     let mut ecc_errors_reported = nvml.as_ref().and_then(|nvml| nvml.sample().ecc_errors);
+    let status_columns = status_columns(
+        march_every > 0,
+        nvml.is_some(),
+        nvml.as_ref()
+            .is_some_and(|nvml| nvml.memory_temperature_missing().is_none()),
+        width,
+    );
 
     // allow write bugs emulation for testing purposes
     let emulate_write_bugs_iteration = env::var("MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION")
@@ -1693,7 +1883,10 @@ fn test_device<Writer: std::io::Write>(
     let mut buffer_in = IOBuf::for_initial_iteration();
     let first_iter_start = time::Instant::now();
     let mut last_status_output = first_iter_start;
-    let mut last_error_state = "          NO ERRORS       ".to_owned();
+    let mut last_error_at: Option<time::Duration> = None;
+    let mut tested_bytes = 0f64; // written + read since the start, March traffic included
+    let mut status_header_due = true;
+    let mut status_legend_due = true;
     // The static window is written once and only re-read, which catches retention errors. It moves to
     // the next window periodically so every window gets both rewrites and long dwell times.
     let mut static_window = 0i64;
@@ -1727,6 +1920,7 @@ fn test_device<Writer: std::io::Write>(
                 1,
             )?;
             written_bytes += test_window_size;
+            tested_bytes += test_window_size as f64;
             bandwidth.add(
                 KernelKind::Write,
                 window_buf.pattern,
@@ -1751,6 +1945,7 @@ fn test_device<Writer: std::io::Write>(
                 let gpu_secs =
                     execute_wait_queue(march_window, pipelines.march, MARCH_VEC4_PER_THREAD)?;
                 // each element reads and writes the whole window
+                tested_bytes += 2.0 * test_window_size as f64;
                 bandwidth.add(
                     KernelKind::March,
                     march_buf.pattern,
@@ -1758,14 +1953,14 @@ fn test_device<Writer: std::io::Write>(
                     gpu_secs,
                 );
                 let march_out = unsafe { std::ptr::read(mapped) };
-                report_window_errors(
+                status_header_due |= report_window_errors(
                     log_dupler,
                     &march_out,
                     test_window_size * march_window,
                     test_window_size,
                     mode,
                     first_iter_start,
-                    &mut last_error_state,
+                    &mut last_error_at,
                 )?;
             }
         }
@@ -1791,7 +1986,7 @@ fn test_device<Writer: std::io::Write>(
                 gpu_secs,
             );
             let last_buffer_out = unsafe { std::ptr::read(mapped) };
-            report_window_errors(
+            status_header_due |= report_window_errors(
                 log_dupler,
                 &last_buffer_out,
                 test_offset,
@@ -1802,11 +1997,12 @@ fn test_device<Writer: std::io::Write>(
                     "INITIAL_READ"
                 },
                 first_iter_start,
-                &mut last_error_state,
+                &mut last_error_at,
             )?;
             last_buffer_out.check_vec_first()?;
         }
         read_bytes += test_window_size * test_window_count;
+        tested_bytes += (test_window_size * test_window_count) as f64;
         read_duration += read_start.elapsed();
         if let Some(nvml) = &nvml
             && last_telemetry_sample.elapsed() >= TELEMETRY_PERIOD
@@ -1839,20 +2035,14 @@ fn test_device<Writer: std::io::Write>(
                     },
                 ),
             };
-            let march_speed = bandwidth
-                .interval_gbps(KernelKind::March)
-                .map(|gbps| format!("   march:{gbps:7.1}GiB/s"))
-                .unwrap_or_default();
-            let telemetry_text = nvml
-                .as_ref()
-                .map(|_| telemetry_interval.status_text())
-                .unwrap_or_default();
+            let march_gbps = bandwidth.interval_gbps(KernelKind::March);
             let full_length_interval =
                 next_report_duration == extended_test_report_duration && !stop_testing;
             let bandwidth_drops = bandwidth.finish_interval(full_length_interval);
             let second1 = time::Duration::from_secs(1);
             if next_report_duration.is_zero() {
-                writeln!(log_dupler, "Standard 5-minute test of {}", selected_label)?;
+                let title = format!("Standard 5-minute test of {selected_label}");
+                writeln!(log_dupler, "{}", console::wrap(&title, width))?;
                 next_report_duration = second1; //2nd report after 1 second
             } else if next_report_duration == second1 {
                 close::raise_status_bit(close::app_status::INITED_OK);
@@ -1865,53 +2055,55 @@ fn test_device<Writer: std::io::Write>(
                     close::fetch_status(),
                     close::app_status::RUNTIME_ERRORS,
                 );
-                match has_errors {
-                    true => writeln!(log_dupler, "Standard 5-minute test fail - ERRORS FOUND"),
-                    false => writeln!(
-                        log_dupler,
-                        "Standard 5-minute test PASSed! Just press Ctrl+C unless you plan long test run."
-                    ),
-                }?;
-                writeln!(
-                    log_dupler,
-                    "Extended endless test started; testing more than 2 hours is usually unneeded"
-                )?;
-                writeln!(
-                    log_dupler,
-                    "use Ctrl+C to stop it when you decide it's enough"
-                )?;
+                let verdict = if has_errors {
+                    "Standard 5-minute test fail - ERRORS FOUND"
+                } else {
+                    "Standard 5-minute test PASSed! Just press Ctrl+C unless you plan long test run."
+                };
+                let message = format!(
+                    "{verdict}\nExtended endless test started; testing more than 2 hours is usually unneeded\nuse Ctrl+C to stop it when you decide it's enough"
+                );
+                writeln!(log_dupler, "{}", console::wrap(&message, width))?;
+                status_header_due = true;
             } else {
-                let formatted_time_hhmmss = (moment_iter_ends - first_iter_start).hhmmssxxx();
-                writeln!(
-                    log_dupler,
-                    "{}    written:{:7.1}GiB{:7.1}GiB/s      checked:{:7.1}GiB{:7.1}GiB/s{}     {}{}",
-                    last_error_state,
-                    written_bytes as f32 / GB,
-                    write_speed_gbps,
-                    read_bytes as f32 / GB,
-                    check_speed_gbps,
-                    march_speed,
-                    formatted_time_hhmmss,
-                    telemetry_text
-                )?;
+                if status_header_due {
+                    if status_legend_due {
+                        let legend = status_legend(&status_columns, query_pool.is_some());
+                        writeln!(log_dupler, "{}", console::wrap(&legend, width))?;
+                        status_legend_due = false;
+                    }
+                    writeln!(log_dupler, "{}", status_header(&status_columns))?;
+                    status_header_due = false;
+                }
+                let values = StatusValues {
+                    elapsed: moment_iter_ends - first_iter_start,
+                    last_error_at,
+                    write_gbps: write_speed_gbps,
+                    read_gbps: check_speed_gbps,
+                    march_gbps,
+                    telemetry: nvml.as_ref().map(|_| &telemetry_interval),
+                    tested_bytes,
+                };
+                writeln!(log_dupler, "{}", status_row(&status_columns, &values))?;
             }
             if let Some(warning) =
                 bandwidth_warning(&bandwidth_drops, nvml.as_ref().map(|_| &telemetry_interval))
             {
-                writeln!(log_dupler, "{warning}")?;
+                writeln!(log_dupler, "{}", console::wrap(&warning, width))?;
+                status_header_due = true;
             }
             if let (Some(reported), Some(now)) =
                 (ecc_errors_reported, telemetry_interval.last().ecc_errors)
                 && now > reported
             {
-                last_error_state =
-                    format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
+                last_error_at = Some(first_iter_start.elapsed());
                 close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
-                writeln!(
-                    log_dupler,
+                let message = format!(
                     "ECC errors found: the driver counted {} new corrected/uncorrected memory errors",
                     now - reported
-                )?;
+                );
+                writeln!(log_dupler, "{}", console::wrap(&message, width))?;
+                status_header_due = true;
                 ecc_errors_reported = Some(now);
             }
             telemetry_interval = Default::default();
@@ -2991,24 +3183,81 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_status_text_shows_interval_peaks() {
+    fn status_columns_fit_the_console_width() {
+        use StatusColumn::*;
+        assert_eq!(
+            status_columns(true, true, true, 119),
+            [
+                Time, Status, Write, Read, March, MemTemp, MemClock, Power, Limit, CoreTemp, Tested
+            ]
+        );
+        // the least important columns go first when the window is narrow
+        assert_eq!(
+            status_columns(true, true, true, 79),
+            [Time, Status, Write, Read, March, MemTemp, MemClock, Power]
+        );
+        // without a memory sensor the core temperature takes its place
+        assert_eq!(
+            status_columns(false, true, false, 79),
+            [Time, Status, Write, Read, CoreTemp, MemClock, Power, Limit]
+        );
+        assert_eq!(
+            status_columns(false, false, false, 39),
+            [Time, Status, Write, Read]
+        );
+        let values = StatusValues {
+            elapsed: time::Duration::from_secs(3600 * 25),
+            last_error_at: Some(time::Duration::from_secs(3600 * 24)),
+            write_gbps: 9999.9,
+            read_gbps: 9999.9,
+            march_gbps: Some(9999.9),
+            telemetry: None,
+            tested_bytes: 1e18,
+        };
+        for width in [39, 49, 59, 79, 99, 119, 159] {
+            let columns = status_columns(true, true, true, width);
+            assert!(status_header(&columns).chars().count() <= width);
+            assert!(status_row(&columns, &values).chars().count() <= width);
+        }
+    }
+
+    #[test]
+    fn status_row_shows_memory_temperature_and_marks_clock_changes() {
         let mut stats = telemetry::IntervalStats::default();
-        for (core, temperature, power) in [(2790, 55, 240.4), (2775, 58, 263.2), (2775, 57, 250.0)]
+        for (clock, memory, power, reasons) in
+            [(13001, 72.0, 262.4, 0x4), (10501, 74.0, 250.0, 0x40)]
         {
             stats.add(telemetry::Sample {
-                mem_clock_mhz: Some(13001),
-                gpu_clock_mhz: Some(core),
-                temperature_c: Some(temperature),
+                mem_clock_mhz: Some(clock),
+                mem_temperature_c: Some(memory),
+                core_temperature_c: Some(58),
                 power_w: Some(power),
-                limit_reasons: Some(0),
+                limit_reasons: Some(reasons),
                 ecc_errors: None,
             });
         }
+        let values = StatusValues {
+            elapsed: time::Duration::from_secs(36),
+            last_error_at: Some(time::Duration::from_secs(83)),
+            write_gbps: 678.94,
+            read_gbps: 697.66,
+            march_gbps: None,
+            telemetry: Some(&stats),
+            tested_bytes: 12.34 * 1024.0 * GB as f64,
+        };
+        let columns = status_columns(true, true, true, 119);
         assert_eq!(
-            stats.status_text(),
-            " mem:13001MHz core:2775MHz max 58C 263W"
+            status_row(&columns, &values),
+            "00:00:36  ERR 00:01:23   678.9   697.7       -   74C  10501*   262W  power,thermal    58C    12.3T"
         );
-        assert_eq!(telemetry::IntervalStats::default().status_text(), "");
+        let quiet = StatusValues {
+            last_error_at: None,
+            telemetry: None,
+            tested_bytes: 936.0 * GB as f64,
+            ..values
+        };
+        assert!(status_row(&columns, &quiet).starts_with("00:00:36  no errors  "));
+        assert!(status_row(&columns, &quiet).ends_with("  936G"));
     }
 
     #[test]

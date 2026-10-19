@@ -1,11 +1,11 @@
-//! Optional GPU telemetry through NVIDIA's NVML library, loaded at runtime when the driver ships it.
+//! Optional GPU telemetry through NVIDIA's NVML library, loaded at runtime when the driver ships it,
+//! plus the GDDR6X memory junction temperature from NVAPI on Windows.
 use std::ffi::{CString, c_char, c_int, c_uint, c_ulonglong, c_void};
 
 type NvmlReturn = c_int;
 type NvmlDevice = *mut c_void;
 
 const NVML_SUCCESS: NvmlReturn = 0;
-const NVML_CLOCK_GRAPHICS: c_int = 0;
 const NVML_CLOCK_MEM: c_int = 2;
 const NVML_TEMPERATURE_GPU: c_int = 0;
 const NVML_MEMORY_ERROR_TYPE_CORRECTED: c_int = 0;
@@ -19,21 +19,23 @@ const LIB_NAME: &str = "libnvidia-ml.so.1";
 
 pub const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
-// Clock event reasons that mean clocks were pulled down by a power or thermal limit.
-// GpuIdle, application clock, sync boost and display clock reasons are not limits.
-const LIMIT_REASONS: [(u64, &str); 5] = [
-    (0x4, "SwPowerCap"),
-    (0x8, "HwSlowdown"),
-    (0x20, "SwThermal"),
-    (0x40, "HwThermal"),
-    (0x80, "HwPowerBrake"),
+// Clock event reasons that mean clocks were pulled down by a power or thermal limit, with the
+// short code shown in the status table. GpuIdle, application clock, sync boost and display clock
+// reasons are not limits.
+const LIMIT_REASONS: [(u64, &str, &str); 5] = [
+    (0x4, "SwPowerCap", "power"),
+    (0x8, "HwSlowdown", "hwslow"),
+    (0x20, "SwThermal", "thermal"),
+    (0x40, "HwThermal", "thermal"),
+    (0x80, "HwPowerBrake", "brake"),
 ];
 
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
 pub struct Sample {
     pub mem_clock_mhz: Option<u32>,
-    pub gpu_clock_mhz: Option<u32>,
-    pub temperature_c: Option<u32>,
+    /// GDDR6X memory junction temperature, when the card has the sensor
+    pub mem_temperature_c: Option<f32>,
+    pub core_temperature_c: Option<u32>,
     pub power_w: Option<f32>,
     pub limit_reasons: Option<u64>,
     /// corrected + uncorrected volatile ECC errors, only on GPUs with ECC enabled
@@ -57,6 +59,7 @@ pub struct Nvml {
     get_power: PowerFn,
     get_limit_reasons: Option<ReasonsFn>,
     get_ecc: Option<EccFn>,
+    memory_junction: Result<MemoryJunction, String>,
     // keeps the function pointers above valid; dropped after nvmlShutdown in Drop
     _library: libloading::Library,
 }
@@ -64,7 +67,13 @@ pub struct Nvml {
 impl Nvml {
     /// Loads NVML and finds the device at the given PCI address. With no PCI address known
     /// (VK_EXT_pci_bus_info missing) the only NVML device is used, if there is exactly one.
-    pub fn open(domain: u32, bus: u32, device: u32, function: u32) -> Result<Self, String> {
+    pub fn open(
+        domain: u32,
+        bus: u32,
+        device: u32,
+        function: u32,
+        device_name: &str,
+    ) -> Result<Self, String> {
         let library = unsafe { libloading::Library::new(LIB_NAME) }
             .map_err(|e| format!("{LIB_NAME} not loaded: {e}"))?;
         unsafe {
@@ -107,6 +116,7 @@ impl Nvml {
                     .map(|p| std::mem::transmute::<*const c_void, ReasonsFn>(p)),
                 get_ecc: optional(b"nvmlDeviceGetTotalEccErrors\0")
                     .map(|p| std::mem::transmute::<*const c_void, EccFn>(p)),
+                memory_junction: MemoryJunction::open(bus, device_name),
                 _library: library,
             })
         }
@@ -162,6 +172,11 @@ impl Nvml {
         }
     }
 
+    /// Why the memory junction temperature isn't available, or None when it is.
+    pub fn memory_temperature_missing(&self) -> Option<&str> {
+        self.memory_junction.as_ref().err().map(String::as_str)
+    }
+
     pub fn sample(&self) -> Sample {
         let read_u32 = |f: &dyn Fn(*mut c_uint) -> NvmlReturn| {
             let mut value: c_uint = 0;
@@ -177,10 +192,8 @@ impl Nvml {
             mem_clock_mhz: read_u32(&|v| unsafe {
                 (self.get_clock)(self.device, NVML_CLOCK_MEM, v)
             }),
-            gpu_clock_mhz: read_u32(&|v| unsafe {
-                (self.get_clock)(self.device, NVML_CLOCK_GRAPHICS, v)
-            }),
-            temperature_c: read_u32(&|v| unsafe {
+            mem_temperature_c: self.memory_junction.as_ref().ok().and_then(|m| m.read()),
+            core_temperature_c: read_u32(&|v| unsafe {
                 (self.get_temperature)(self.device, NVML_TEMPERATURE_GPU, v)
             }),
             power_w: read_u32(&|v| unsafe { (self.get_power)(self.device, v) })
@@ -204,13 +217,164 @@ impl Drop for Nvml {
     }
 }
 
+/// GDDR6X memory junction temperature from NVAPI's undocumented thermal-sensor query, the source
+/// HWiNFO and LibreHardwareMonitor read. NVML has no memory temperature on GeForce cards.
+#[cfg(windows)]
+struct MemoryJunction {
+    gpu: *mut c_void,
+    sensor_index: usize,
+    mask: u32,
+    get_sensors: ThermalSensorsFn,
+    _library: libloading::Library,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ThermalSensors {
+    version: u32,
+    mask: u32,
+    reserved: [i32; 8],
+    temperatures: [i32; 32], // 1/256 degrees C
+}
+
+#[cfg(windows)]
+type ThermalSensorsFn = unsafe extern "C" fn(*mut c_void, *mut ThermalSensors) -> c_int;
+
+#[cfg(windows)]
+fn query_sensors(get: ThermalSensorsFn, gpu: *mut c_void, mask: u32) -> Option<ThermalSensors> {
+    let mut sensors = ThermalSensors {
+        version: size_of::<ThermalSensors>() as u32 | (2 << 16),
+        mask,
+        reserved: [0; 8],
+        temperatures: [0; 32],
+    };
+    (unsafe { get(gpu, &mut sensors) } == 0).then_some(sensors)
+}
+
+#[cfg(windows)]
+impl MemoryJunction {
+    // nvapi_QueryInterface ids
+    const INITIALIZE: u32 = 0x0150_E828;
+    const ENUM_PHYSICAL_GPUS: u32 = 0xE5AC_921F;
+    const GPU_GET_BUS_ID: u32 = 0x1BE0_B8E5;
+    const GPU_THERMAL_GET_SENSORS: u32 = 0x65FE_3AAD; // undocumented
+
+    fn open(pci_bus: u32, device_name: &str) -> Result<Self, String> {
+        // the junction sensor's slot differs per generation, same mapping as LibreHardwareMonitor
+        let sensor_index = if device_name.starts_with("NVIDIA GeForce RTX 50") {
+            2
+        } else if device_name.starts_with("NVIDIA GeForce RTX 40") {
+            7
+        } else {
+            9
+        };
+        let library = unsafe { libloading::Library::new("nvapi64.dll") }
+            .map_err(|e| format!("nvapi64.dll not loaded: {e}"))?;
+        unsafe {
+            let query = *library
+                .get::<unsafe extern "C" fn(u32) -> *const c_void>(b"nvapi_QueryInterface\0")
+                .map_err(|e| e.to_string())?;
+            let lookup = |id: u32| {
+                let function = query(id);
+                if function.is_null() {
+                    Err(format!("NVAPI function 0x{id:08X} not available"))
+                } else {
+                    Ok(function)
+                }
+            };
+            let initialize = std::mem::transmute::<*const c_void, unsafe extern "C" fn() -> c_int>(
+                lookup(Self::INITIALIZE)?,
+            );
+            let enum_gpus = std::mem::transmute::<
+                *const c_void,
+                unsafe extern "C" fn(*mut [*mut c_void; 64], *mut u32) -> c_int,
+            >(lookup(Self::ENUM_PHYSICAL_GPUS)?);
+            let get_bus_id = std::mem::transmute::<
+                *const c_void,
+                unsafe extern "C" fn(*mut c_void, *mut u32) -> c_int,
+            >(lookup(Self::GPU_GET_BUS_ID)?);
+            let get_sensors = std::mem::transmute::<*const c_void, ThermalSensorsFn>(lookup(
+                Self::GPU_THERMAL_GET_SENSORS,
+            )?);
+            if initialize() != 0 {
+                return Err("NvAPI_Initialize failed".to_owned());
+            }
+            let mut handles = [std::ptr::null_mut(); 64];
+            let mut count = 0u32;
+            if enum_gpus(&mut handles, &mut count) != 0 {
+                return Err("NvAPI_EnumPhysicalGPUs failed".to_owned());
+            }
+            let gpus = &handles[..(count as usize).min(handles.len())];
+            let gpu = gpus
+                .iter()
+                .copied()
+                .find(|&gpu| {
+                    let mut bus = 0u32;
+                    get_bus_id(gpu, &mut bus) == 0 && bus == pci_bus
+                })
+                .or_else(|| (pci_bus == 0 && gpus.len() == 1).then(|| gpus[0]))
+                .ok_or_else(|| format!("no NVAPI GPU on PCI bus 0x{pci_bus:02X}"))?;
+            // the query fails for mask bits past the last sensor
+            let sensor_count = (0..32)
+                .take_while(|bit| query_sensors(get_sensors, gpu, 1 << bit).is_some())
+                .count();
+            if sensor_index >= sensor_count {
+                return Err(format!(
+                    "the GPU reports {sensor_count} thermal sensors, none in the memory junction slot"
+                ));
+            }
+            let junction = Self {
+                gpu,
+                sensor_index,
+                mask: ((1u64 << sensor_count) - 1) as u32,
+                get_sensors,
+                _library: library,
+            };
+            match junction.read() {
+                Some(_) => Ok(junction),
+                None => {
+                    Err("the memory junction sensor reads 0 (no GDDR6X junction sensor)".to_owned())
+                }
+            }
+        }
+    }
+
+    fn read(&self) -> Option<f32> {
+        let sensors = query_sensors(self.get_sensors, self.gpu, self.mask)?;
+        let celsius = sensors.temperatures[self.sensor_index] as f32 / 256.0;
+        (celsius > 0.0 && celsius < 150.0).then_some(celsius)
+    }
+}
+
+#[cfg(not(windows))]
+struct MemoryJunction;
+
+#[cfg(not(windows))]
+impl MemoryJunction {
+    fn open(_pci_bus: u32, _device_name: &str) -> Result<Self, String> {
+        Err("memory junction temperature comes from NVAPI, which is Windows-only".to_owned())
+    }
+
+    fn read(&self) -> Option<f32> {
+        None
+    }
+}
+
+fn max_f32(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Telemetry gathered over one report interval.
 #[derive(Default, Debug)]
 pub struct IntervalStats {
     last: Sample,
     mem_clock_min: Option<u32>,
     mem_clock_max: Option<u32>,
-    temperature_max: Option<u32>,
+    mem_temperature_max: Option<f32>,
+    core_temperature_max: Option<u32>,
     power_max: Option<f32>,
     limit_reasons: u64,
 }
@@ -221,46 +385,40 @@ impl IntervalStats {
             self.mem_clock_min = Some(self.mem_clock_min.map_or(clock, |c| c.min(clock)));
             self.mem_clock_max = Some(self.mem_clock_max.map_or(clock, |c| c.max(clock)));
         }
-        self.temperature_max = sample.temperature_c.max(self.temperature_max);
-        self.power_max = match (self.power_max, sample.power_w) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+        self.mem_temperature_max = max_f32(self.mem_temperature_max, sample.mem_temperature_c);
+        self.core_temperature_max = sample.core_temperature_c.max(self.core_temperature_max);
+        self.power_max = max_f32(self.power_max, sample.power_w);
         self.limit_reasons |= sample.limit_reasons.unwrap_or(0);
         self.last = sample;
     }
     pub fn mem_clock_range(&self) -> Option<(u32, u32)> {
         self.mem_clock_min.zip(self.mem_clock_max)
     }
+    pub fn mem_temperature_max(&self) -> Option<f32> {
+        self.mem_temperature_max
+    }
+    pub fn core_temperature_max(&self) -> Option<u32> {
+        self.core_temperature_max
+    }
+    pub fn power_max(&self) -> Option<f32> {
+        self.power_max
+    }
     pub fn throttle_names(&self) -> Vec<&'static str> {
         LIMIT_REASONS
             .iter()
-            .filter(|(bit, _)| self.limit_reasons & bit != 0)
-            .map(|(_, name)| *name)
+            .filter(|(bit, _, _)| self.limit_reasons & bit != 0)
+            .map(|(_, name, _)| *name)
             .collect()
     }
-    /// Compact status-line text, e.g. " mem:13001MHz core:2775MHz 58C max 263W"
-    pub fn status_text(&self) -> String {
-        let mut text = String::new();
-        match self.mem_clock_range() {
-            Some((low, high)) if low != high => text += &format!(" mem:{low}-{high}MHz"),
-            Some((clock, _)) => text += &format!(" mem:{clock}MHz"),
-            None => {}
+    /// Short limit codes for the status table, e.g. "power" or "power,thermal"
+    pub fn limit_codes(&self) -> String {
+        let mut codes: Vec<&str> = Vec::new();
+        for (bit, _, code) in LIMIT_REASONS {
+            if self.limit_reasons & bit != 0 && !codes.contains(&code) {
+                codes.push(code);
+            }
         }
-        if let Some(clock) = self.last.gpu_clock_mhz {
-            text += &format!(" core:{clock}MHz");
-        }
-        if let Some(temperature) = self.temperature_max {
-            text += &format!(" max {temperature}C");
-        }
-        if let Some(power) = self.power_max {
-            text += &format!(" {power:.0}W");
-        }
-        let throttle = self.throttle_names();
-        if !throttle.is_empty() {
-            text += &format!(" limit:{}", throttle.join(","));
-        }
-        text
+        codes.join(",")
     }
     pub fn last(&self) -> Sample {
         self.last

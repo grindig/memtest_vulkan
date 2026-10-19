@@ -3,6 +3,7 @@ mod erupt_vendored_utils_loading;
 mod input;
 mod output;
 mod ram;
+mod telemetry;
 
 pub use erupt::{CustomEntryLoader, LoaderError}; // republish for vendored part
 
@@ -68,7 +69,7 @@ static LAYER_KHRONOS_VALIDATION_ARRAY: CStrStaticPtr<1> =
 // Workaround it by explicitly passing empty array
 static NO_EXTENSIONS_ARRAY: CStrStaticPtr<0> = CStrStaticPtr([]);
 
-const GB: f32 = (1024 * 1024 * 1024) as f32;
+const GB: f32 = (1024 * 1024 * 1024) as f32; // a GiB: all sizes and speeds are printed as GiB and GiB/s
 const READ_SHADER: &[u32] = memtest_vulkan_build::compiled_vk_compute_spirv!(
     r#"
 struct IOBuf
@@ -86,7 +87,7 @@ struct IOBuf
     calc_param: u32,
     pattern: u32,
     march_flags: u32,
-    reserved0: u32,
+    march_chunk: u32,
     reserved1: u32,
     first_elem: vec4<u32>
 }
@@ -205,7 +206,6 @@ fn record_errors(effective_addr: u32, actual_value: vec4<u32>, expected_value: v
 
 let TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
 let TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
-let MARCH_VEC4_PER_THREAD: u32 = 16u;
 
 @compute @workgroup_size(64, 1, 1)
 fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
@@ -259,14 +259,15 @@ fn march(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(num_workgroups
     let pattern = io.pattern;
     let read_inverted = (io.march_flags & 1u) != 0u;
     let descending = (io.march_flags & 2u) != 0u;
+    let chunk = io.march_chunk; //vec4 per thread, set by the host that also sizes the dispatch
     let group_count = num_workgroups[0] * num_workgroups[1];
     let linear_group = workgroup_id[0] + workgroup_id[1] * num_workgroups[0];
     let group = select(linear_group, group_count - 1u - linear_group, descending);
     let lane = select(local_index, 63u - local_index, descending);
     let read_mask = select(vec4<u32>(0u), vec4<u32>(0xFFFFFFFFu), vec4<bool>(read_inverted));
-    let chunk_base = group * 64u * MARCH_VEC4_PER_THREAD;
-    for(var j: u32 = 0u; j < MARCH_VEC4_PER_THREAD; j++) {
-        let step = select(j, MARCH_VEC4_PER_THREAD - 1u - j, descending);
+    let chunk_base = group * 64u * chunk;
+    for(var j: u32 = 0u; j < chunk; j++) {
+        let step = select(j, chunk - 1u - j, descending);
         let idx = chunk_base + step * 64u + lane;
         let expected_value = test_value_by_index(idx, p, pattern) ^ read_mask;
         let actual_value = test[idx];
@@ -296,7 +297,7 @@ const ALLOCATION_TRY_STEP: i64 = TEST_DATA_KEEP_FREE;
 
 const MAP_FOR_GETTING_ADDRESS_SIZE: u64 = 2 * 1024 * 1024; // signle huge page
 
-const MARCH_VEC4_PER_THREAD: u32 = 16; // keep in sync with the shader constant
+const MARCH_VEC4_PER_THREAD: u32 = 16; // passed to the shader in IOBuf::march_chunk
 // March C- elements after the write pass: up(r0,w1) up(r1,w0) down(r0,w1) down(r1,w0); the read pass is the final r0
 const MARCH_ELEMENTS: [(u32, &str); 4] = [
     (0b00, "MARCH_UP_R0W1"),
@@ -304,10 +305,15 @@ const MARCH_ELEMENTS: [(u32, &str); 4] = [
     (0b10, "MARCH_DOWN_R0W1"),
     (0b11, "MARCH_DOWN_R1W0"),
 ];
+// March C- on every pass took ~64% of GPU time; every 2nd block keeps streaming passes around half
+const DEFAULT_MARCH_EVERY: u32 = 2;
 // how long one window keeps its data untouched for retention checking before another window takes over
 const STATIC_WINDOW_ROTATE_PERIOD: time::Duration = time::Duration::from_secs(60);
 // GPU-timed bandwidth this far below the best seen for the same kernel+pattern, two reports in a row, is reported
 const BANDWIDTH_DROP_THRESHOLD: f64 = 0.05;
+// a kernel+pattern needs this many timed dispatches in a report interval before its median is trusted
+const BANDWIDTH_MIN_DISPATCHES: usize = 8;
+const TELEMETRY_PERIOD: time::Duration = time::Duration::from_secs(1);
 
 const PATTERN_ADDR_ROTATE: u32 = 0;
 const PATTERN_RANDOM: u32 = 1;
@@ -409,6 +415,27 @@ fn pattern_for(iter: u32, window_idx: u32, extended: bool) -> u32 {
     };
     let variant = ((round >> 1) & 0xFF) << 8;
     family | variant | invert
+}
+
+/// Window that gets the March C- elements in this pass, or None for a pass without March.
+/// A window's pattern family advances by one every pass, so March stays on one window for
+/// PATTERN_FAMILY_COUNT consecutive passes to see every family, then skips
+/// (march_every - 1) such blocks and moves on to the next non-static window.
+fn march_window_for(
+    iteration: u32,
+    window_count: i64,
+    static_window: i64,
+    march_every: u32,
+) -> Option<i64> {
+    if march_every == 0 || window_count < 2 {
+        return None;
+    }
+    let block = iteration.saturating_sub(1) / PATTERN_FAMILY_COUNT;
+    if !block.is_multiple_of(march_every) {
+        return None;
+    }
+    let march_block = (block / march_every) as i64;
+    Some((static_window + 1 + march_block % (window_count - 1)) % window_count)
 }
 
 fn pattern_name(pattern: u32) -> String {
@@ -534,18 +561,23 @@ struct IOBuf {
     calc_param: u32,
     pattern: u32,
     march_flags: u32,
-    reserved0: u32, // padding: first_elem is a vec4 and must stay 16-byte aligned like in WGSL
-    reserved1: u32,
+    march_chunk: u32, // vec4 per March thread; the host sizes the dispatch with the same value
+    reserved1: u32,   // padding: first_elem is a vec4 and must stay 16-byte aligned like in WGSL
     first_elem: MostlyZeroArr<VEC_SIZE>,
 }
 
 impl fmt::Display for IOBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // actual_min/max skip all-ones words, so with only those the range is empty
+        let values_range = if self.actual_min <= self.actual_max {
+            format!("0x{:08X}..=0x{:08X}", self.actual_min, self.actual_max)
+        } else {
+            "none".to_owned()
+        };
         writeln!(
             f,
-            "values range: 0x{:08X}..=0x{:08X}   FFFFFFFF-like count:{}   pattern:{}    bit-level stats table:",
-            self.actual_max,
-            self.actual_min,
+            "values range: {}   FFFFFFFF-like count:{}   pattern:{}    bit-level stats table:",
+            values_range,
             self.actual_ff,
             pattern_name(self.pattern)
         )?;
@@ -804,7 +836,7 @@ fn try_fill_default_mem_budget<Writer: std::io::Write>(
         if env.verbose() {
             let _ = writeln!(
                 log_dupler,
-                "heap size {:4.1}GB budget {:4.1}GB usage {:4.1}GB flags={:#?}",
+                "heap size {:4.1}GiB budget {:4.1}GiB usage {:4.1}GiB flags={:#?}",
                 selected_device.memory_props.memory_heaps[i].size as f32 / GB,
                 selected_device.budget_props.heap_budget[i] as f32 / GB,
                 selected_device.budget_props.heap_usage[i] as f32 / GB,
@@ -955,6 +987,7 @@ fn prepare_and_test_device<Writer: std::io::Write>(
         selected.physical_props,
         selected.max_memory_allocation_size,
         selected.timestamp_valid_bits,
+        selected.pci_bus_info,
         env,
     ) {
         display_this_process_result(Some(e), env)
@@ -962,7 +995,7 @@ fn prepare_and_test_device<Writer: std::io::Write>(
     display_this_process_result(None, env)
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum KernelKind {
     Write,
     Read,
@@ -996,11 +1029,31 @@ impl BandwidthSample {
 struct BandwidthHistory {
     best_gbps: f64,
     low_reports: u32,
-    interval: BandwidthSample,
+    dispatch_gbps: Vec<f64>, // one value per timed dispatch in the current report interval
+}
+
+#[derive(Debug, PartialEq)]
+struct BandwidthDrop {
+    kind: KernelKind,
+    family: u32,
+    gbps: f64,
+    best_gbps: f64,
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
 }
 
 /// GPU-timed bandwidth per kernel and pattern family. Link EDC retries on unstable GDDR
 /// don't produce data errors, only lost bandwidth, so a sustained drop is worth reporting.
+/// The median of individual dispatches is compared, so a few dispatches slowed by other
+/// GPU work can't fake a drop.
 #[derive(Default)]
 struct BandwidthTracker {
     history: std::collections::BTreeMap<(KernelKind, u32), BandwidthHistory>,
@@ -1012,33 +1065,38 @@ impl BandwidthTracker {
         let Some(secs) = gpu_secs.filter(|s| *s > 0.0) else {
             return;
         };
-        let entry = self.history.entry((kind, pattern & 0xFF)).or_default();
-        entry.interval.bytes += bytes as f64;
-        entry.interval.secs += secs;
+        self.history
+            .entry((kind, pattern & 0xFF))
+            .or_default()
+            .dispatch_gbps
+            .push(bytes as f64 / GB as f64 / secs);
         self.totals[kind as usize].bytes += bytes as f64;
         self.totals[kind as usize].secs += secs;
     }
     fn interval_gbps(&self, kind: KernelKind) -> Option<f64> {
         self.totals[kind as usize].gbps()
     }
-    /// Closes the report interval. Only full-length intervals are compared against the best seen.
-    fn finish_interval(&mut self, comparable: bool) -> Option<String> {
+    /// Closes the report interval and returns the kernel+pattern pairs that were more than
+    /// BANDWIDTH_DROP_THRESHOLD below their best for two comparable intervals in a row.
+    /// An interval that isn't comparable (startup, partial, too few dispatches) breaks the streak.
+    fn finish_interval(&mut self, comparable: bool) -> Vec<BandwidthDrop> {
         let mut dropped = Vec::new();
         for (&(kind, family), entry) in self.history.iter_mut() {
-            let sample = mem::take(&mut entry.interval);
-            let Some(gbps) = sample.gbps().filter(|_| comparable) else {
+            let mut samples = mem::take(&mut entry.dispatch_gbps);
+            if !comparable || samples.len() < BANDWIDTH_MIN_DISPATCHES {
+                entry.low_reports = 0;
                 continue;
-            };
+            }
+            let gbps = median(&mut samples);
             if entry.best_gbps > 0.0 && gbps < entry.best_gbps * (1.0 - BANDWIDTH_DROP_THRESHOLD) {
                 entry.low_reports += 1;
                 if entry.low_reports >= 2 {
-                    dropped.push(format!(
-                        "{}/{} {:.1}GB/s ({:+.1}%)",
-                        kind.name(),
-                        PATTERN_NAMES.get(family as usize).unwrap_or(&"unknown"),
+                    dropped.push(BandwidthDrop {
+                        kind,
+                        family,
                         gbps,
-                        (gbps / entry.best_gbps - 1.0) * 100.0
-                    ));
+                        best_gbps: entry.best_gbps,
+                    });
                 }
             } else {
                 entry.low_reports = 0;
@@ -1046,15 +1104,49 @@ impl BandwidthTracker {
             entry.best_gbps = entry.best_gbps.max(gbps);
         }
         self.totals = Default::default();
-        if dropped.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "BANDWIDTH DROP: more than {:.0}% below best for 2+ reports: {}. If the memory clock is steady this points to link EDC retries (unstable memory), otherwise to thermal or power throttling.",
-            BANDWIDTH_DROP_THRESHOLD * 100.0,
-            dropped.join(", ")
-        ))
+        dropped
     }
+}
+
+/// Warning text for sustained drops, using the interval's telemetry to name the likely cause.
+fn bandwidth_warning(
+    drops: &[BandwidthDrop],
+    telemetry: Option<&telemetry::IntervalStats>,
+) -> Option<String> {
+    if drops.is_empty() {
+        return None;
+    }
+    let list = drops
+        .iter()
+        .map(|d| {
+            format!(
+                "{}/{} {:.1}GiB/s ({:+.1}%)",
+                d.kind.name(),
+                PATTERN_NAMES.get(d.family as usize).unwrap_or(&"unknown"),
+                d.gbps,
+                (d.gbps / d.best_gbps - 1.0) * 100.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // power/thermal limits mostly lower the core clock, so a steady memory clock still matters with them
+    let cause = match telemetry.map(|t| (t.mem_clock_range(), t.throttle_names())) {
+        Some((Some((low, high)), _)) if low != high => format!(
+            "The memory clock varied {low}-{high}MHz in this interval, so a clock change is the likely cause."
+        ),
+        Some((Some((clock, _)), limits)) if !limits.is_empty() => format!(
+            "The memory clock stayed at {clock}MHz, but the driver also reports clock limiting ({}), which lowers the core clock. If the drop persists without limiting, suspect link EDC retries (unstable memory).",
+            limits.join(",")
+        ),
+        Some((Some((clock, _)), _)) => format!(
+            "The memory clock stayed at {clock}MHz with no clock limiting reported, which points to link EDC retries (unstable memory)."
+        ),
+        _ => "If the memory clock is steady this points to link EDC retries (unstable memory), otherwise to thermal or power throttling.".to_owned(),
+    };
+    Some(format!(
+        "BANDWIDTH DROP: median dispatch bandwidth more than {:.0}% below best for 2+ reports: {list}. {cause}",
+        BANDWIDTH_DROP_THRESHOLD * 100.0
+    ))
 }
 
 fn report_window_errors<Writer: std::io::Write>(
@@ -1130,6 +1222,7 @@ fn test_device<Writer: std::io::Write>(
     physical_props: vk::PhysicalDeviceProperties,
     max_memory_allocation_size: u64,
     timestamp_valid_bits: u32,
+    pci_bus_info: ext_pci_bus_info::PhysicalDevicePCIBusInfoPropertiesEXT,
     env: &ProcessEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut allocation_size = env.max_test_bytes.load(SeqCst);
@@ -1139,6 +1232,15 @@ fn test_device<Writer: std::io::Write>(
     // MEMTEST_VULKAN_MODE=classic keeps the original single-pattern test without March passes
     let extended =
         !env::var("MEMTEST_VULKAN_MODE").is_ok_and(|mode| mode.eq_ignore_ascii_case("classic"));
+    // MEMTEST_VULKAN_MARCH_EVERY=N runs March C- in 1 of every N blocks of passes, 0 disables it
+    let march_every = if extended {
+        env::var("MEMTEST_VULKAN_MARCH_EVERY")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_MARCH_EVERY)
+    } else {
+        0
+    };
 
     let io_data_size = mem::size_of::<IOBuf>() as vk::DeviceSize;
 
@@ -1283,8 +1385,12 @@ fn test_device<Writer: std::io::Write>(
     if env.verbose() {
         let _ = writeln!(
             log_dupler,
-            "maxMemoryAllocationSize {:5.1}GB maxStorageBufferRange {:5.1}GB -> window size limit {:5.3}GB, timestamps {}",
-            max_memory_allocation_size as f32 / GB,
+            "maxMemoryAllocationSize {} maxStorageBufferRange {:5.1}GiB -> window size limit {:5.3}GiB, timestamps {}",
+            match max_memory_allocation_size {
+                0 => "unknown".to_owned(),
+                size if size >= 1 << 40 => "unlimited".to_owned(), // NVIDIA reports u64::MAX
+                size => format!("{:5.1}GiB", size as f32 / GB),
+            },
             physical_props.limits.max_storage_buffer_range as f32 / GB,
             max_window_size as f32 / GB,
             if query_pool.is_some() { "on" } else { "off" },
@@ -1317,7 +1423,7 @@ fn test_device<Writer: std::io::Write>(
         if env.verbose() {
             let _ = writeln!(
                 log_dupler,
-                "Trying {:7.3}GB as {} windows of {:5.3}GB...",
+                "Trying {:7.3}GiB as {} windows of {:5.3}GiB...",
                 allocation_size as f32 / GB,
                 test_window_count,
                 test_window_size as f32 / GB
@@ -1452,7 +1558,7 @@ fn test_device<Writer: std::io::Write>(
         if env.verbose() {
             let _ = writeln!(
                 log_dupler,
-                "Don't testing {:5.1}GB due to error: {}",
+                "Don't testing {:5.1}GiB due to error: {}",
                 allocation_size as f32 / GB,
                 last_err
             );
@@ -1464,7 +1570,7 @@ fn test_device<Writer: std::io::Write>(
             warn_on_budget_alloc_fail = false;
             let _ = writeln!(
                 log_dupler,
-                "Failed allocating {:5.1}GB, trying to use smaller size. More system memory can help.",
+                "Failed allocating {:5.1}GiB, trying to use smaller size. More system memory can help.",
                 allocation_size as f32 / GB
             );
         }
@@ -1510,7 +1616,7 @@ fn test_device<Writer: std::io::Write>(
     if env.verbose() {
         let _ = writeln!(
             log_dupler,
-            "Test memory size {:5.1}GB in {} windows  type {:2}: {:?} {:?} suitable 0b{:032b}",
+            "Test memory size {:5.1}GiB in {} windows  type {:2}: {:?} {:?} suitable 0b{:032b}",
             (test_window_size * test_window_count) as f32 / GB,
             test_window_count,
             test_mem_index,
@@ -1522,8 +1628,13 @@ fn test_device<Writer: std::io::Write>(
     if extended {
         writeln!(
             log_dupler,
-            "Extended mode: {} data-pattern families, March C- on one window per pass, retention window rotates every {}s (MEMTEST_VULKAN_MODE=classic for the original test)",
+            "Extended mode: {} data-pattern families, {}, retention window rotates every {}s (MEMTEST_VULKAN_MODE=classic for the original test)",
             PATTERN_FAMILY_COUNT,
+            match march_every {
+                0 => "March C- off".to_owned(),
+                1 => "March C- on every pass".to_owned(),
+                n => format!("March C- on 1 of every {n} blocks of {PATTERN_FAMILY_COUNT} passes"),
+            },
             STATIC_WINDOW_ROTATE_PERIOD.as_secs()
         )?;
     }
@@ -1533,6 +1644,38 @@ fn test_device<Writer: std::io::Write>(
             "GPU timestamps unavailable: speeds use CPU time and bandwidth-drop detection is off"
         )?;
     }
+    // MEMTEST_VULKAN_TELEMETRY=0 skips loading NVML
+    let nvml = if physical_props.vendor_id != telemetry::NVIDIA_VENDOR_ID
+        || env::var("MEMTEST_VULKAN_TELEMETRY").is_ok_and(|v| v == "0")
+    {
+        None
+    } else {
+        match telemetry::Nvml::open(
+            pci_bus_info.pci_domain,
+            pci_bus_info.pci_bus,
+            pci_bus_info.pci_device,
+            pci_bus_info.pci_function,
+        ) {
+            Ok(nvml) => {
+                writeln!(
+                    log_dupler,
+                    "Telemetry: NVML (memory/core clock, temperature, power, clock limit reasons, ECC if enabled)"
+                )?;
+                Some(nvml)
+            }
+            Err(e) => {
+                if env.verbose() {
+                    let _ = writeln!(log_dupler, "Telemetry unavailable: {e}");
+                }
+                None
+            }
+        }
+    };
+    let mut telemetry_interval = telemetry::IntervalStats::default();
+    // NVML lags behind the GPU waking from idle, so the first sample waits one TELEMETRY_PERIOD
+    let mut last_telemetry_sample = time::Instant::now();
+    // ECC counters only exist on GPUs with ECC enabled; any increase is a memory error the test didn't see
+    let mut ecc_errors_reported = nvml.as_ref().and_then(|nvml| nvml.sample().ecc_errors);
 
     // allow write bugs emulation for testing purposes
     let emulate_write_bugs_iteration = env::var("MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION")
@@ -1546,6 +1689,7 @@ fn test_device<Writer: std::io::Write>(
     let extended_test_report_duration = time::Duration::from_secs(30);
     let mut reports_before_standard_done = 12i32;
     let mut write_duration = time::Duration::ZERO;
+    let mut read_duration = time::Duration::ZERO;
     let mut buffer_in = IOBuf::for_initial_iteration();
     let first_iter_start = time::Instant::now();
     let mut last_status_output = first_iter_start;
@@ -1555,7 +1699,6 @@ fn test_device<Writer: std::io::Write>(
     let mut static_window = 0i64;
     let mut static_buf = IOBuf::for_initial_iteration(); // what the initial fill left in window 0
     let mut static_since = first_iter_start;
-    let mut march_window = 0i64;
     let mut bandwidth = BandwidthTracker::default();
     for iteration in 1..=iter_count {
         let mut static_rewrite = false;
@@ -1592,16 +1735,18 @@ fn test_device<Writer: std::io::Write>(
             );
         }
         write_duration += write_start.elapsed();
-        if extended {
-            // one non-static window per pass gets the March C- elements; the read pass below is the final r0
-            march_window = (march_window + 1) % test_window_count;
-            if march_window == static_window {
-                march_window = (march_window + 1) % test_window_count;
-            }
+        // March C- elements on one non-static window; the read pass below is the final r0
+        if let Some(march_window) = march_window_for(
+            iteration as u32,
+            test_window_count,
+            static_window,
+            march_every,
+        ) {
             let window_buf = buffer_in.for_window(march_window, extended);
             for (march_flags, mode) in MARCH_ELEMENTS {
                 let mut march_buf = window_buf;
                 march_buf.march_flags = march_flags;
+                march_buf.march_chunk = MARCH_VEC4_PER_THREAD;
                 unsafe { std::ptr::write(mapped, march_buf) }
                 let gpu_secs =
                     execute_wait_queue(march_window, pipelines.march, MARCH_VEC4_PER_THREAD)?;
@@ -1624,6 +1769,7 @@ fn test_device<Writer: std::io::Write>(
                 )?;
             }
         }
+        let read_start = time::Instant::now();
         for window_idx in 0..test_window_count {
             let reread_mode_for_this_win = window_idx == static_window && !static_rewrite;
             let window_buf = if window_idx == static_window {
@@ -1661,12 +1807,20 @@ fn test_device<Writer: std::io::Write>(
             last_buffer_out.check_vec_first()?;
         }
         read_bytes += test_window_size * test_window_count;
+        read_duration += read_start.elapsed();
+        if let Some(nvml) = &nvml
+            && last_telemetry_sample.elapsed() >= TELEMETRY_PERIOD
+        {
+            telemetry_interval.add(nvml.sample());
+            last_telemetry_sample = time::Instant::now();
+        }
         let moment_iter_ends = time::Instant::now();
         let elapsed = moment_iter_ends - last_status_output;
         let stop_testing = close::close_requested();
         if elapsed > next_report_duration || stop_testing {
+            // CPU-timed fallback when GPU timestamps are unavailable; March time counts toward neither
             let write_secs = write_duration.as_secs_f32();
-            let passed_secs = elapsed.as_secs_f32() - write_secs;
+            let passed_secs = read_duration.as_secs_f32();
             let (write_speed_gbps, check_speed_gbps) = match (
                 bandwidth.interval_gbps(KernelKind::Write),
                 bandwidth.interval_gbps(KernelKind::Read),
@@ -1687,11 +1841,15 @@ fn test_device<Writer: std::io::Write>(
             };
             let march_speed = bandwidth
                 .interval_gbps(KernelKind::March)
-                .map(|gbps| format!("   march:{gbps:7.1}GB/s"))
+                .map(|gbps| format!("   march:{gbps:7.1}GiB/s"))
+                .unwrap_or_default();
+            let telemetry_text = nvml
+                .as_ref()
+                .map(|_| telemetry_interval.status_text())
                 .unwrap_or_default();
             let full_length_interval =
                 next_report_duration == extended_test_report_duration && !stop_testing;
-            let bandwidth_warning = bandwidth.finish_interval(full_length_interval);
+            let bandwidth_drops = bandwidth.finish_interval(full_length_interval);
             let second1 = time::Duration::from_secs(1);
             if next_report_duration.is_zero() {
                 writeln!(log_dupler, "Standard 5-minute test of {}", selected_label)?;
@@ -1726,19 +1884,37 @@ fn test_device<Writer: std::io::Write>(
                 let formatted_time_hhmmss = (moment_iter_ends - first_iter_start).hhmmssxxx();
                 writeln!(
                     log_dupler,
-                    "{}    written:{:7.1}GB{:7.1}GB/s      checked:{:7.1}GB{:7.1}GB/s{}     {}",
+                    "{}    written:{:7.1}GiB{:7.1}GiB/s      checked:{:7.1}GiB{:7.1}GiB/s{}     {}{}",
                     last_error_state,
                     written_bytes as f32 / GB,
                     write_speed_gbps,
                     read_bytes as f32 / GB,
                     check_speed_gbps,
                     march_speed,
-                    formatted_time_hhmmss
+                    formatted_time_hhmmss,
+                    telemetry_text
                 )?;
             }
-            if let Some(warning) = bandwidth_warning {
+            if let Some(warning) =
+                bandwidth_warning(&bandwidth_drops, nvml.as_ref().map(|_| &telemetry_interval))
+            {
                 writeln!(log_dupler, "{warning}")?;
             }
+            if let (Some(reported), Some(now)) =
+                (ecc_errors_reported, telemetry_interval.last().ecc_errors)
+                && now > reported
+            {
+                last_error_state =
+                    format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
+                close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
+                writeln!(
+                    log_dupler,
+                    "ECC errors found: the driver counted {} new corrected/uncorrected memory errors",
+                    now - reported
+                )?;
+                ecc_errors_reported = Some(now);
+            }
+            telemetry_interval = Default::default();
             reports_before_standard_done -= 1;
             if reports_before_standard_done == 0 {
                 // The last iteration before report has a sleep before it to test hot gpu behaviour
@@ -1748,6 +1924,7 @@ fn test_device<Writer: std::io::Write>(
             written_bytes = 0i64;
             read_bytes = 0i64;
             write_duration = time::Duration::ZERO;
+            read_duration = time::Duration::ZERO;
             last_status_output = time::Instant::now();
         }
         if stop_testing {
@@ -1785,6 +1962,7 @@ struct NamedComputeDevice {
     index_in_device_iteration: usize,
     max_memory_allocation_size: u64, // 0 when unknown (Vulkan 1.0)
     timestamp_valid_bits: u32,
+    pci_bus_info: ext_pci_bus_info::PhysicalDevicePCIBusInfoPropertiesEXT, // zeroes when unknown
 }
 
 fn load_instance<Writer: std::io::Write>(
@@ -2085,7 +2263,7 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
         }
         numbered_devices.push(NamedComputeDevice {
             label: std::format!(
-                "{}: Bus=0x{:02X}:{:02X} DevId=0x{:04X} {api_info}  {}GB {}",
+                "{}: Bus=0x{:02X}:{:02X} DevId=0x{:04X} {api_info}  {}GiB {}",
                 i + 1,
                 pci_props.pci_bus,
                 pci_props.pci_device,
@@ -2105,6 +2283,7 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             index_in_device_iteration: d.6,
             max_memory_allocation_size: d.7,
             timestamp_valid_bits: d.8,
+            pci_bus_info: d.3,
         });
     }
     Ok(LoadedDevices::new(
@@ -2671,6 +2850,165 @@ mod tests {
         buf.mem_bitcount.0[17] = 1;
         let (_, total) = buf.get_error_addresses_and_count(0).unwrap();
         assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn march_schedule_covers_every_family_on_every_window() {
+        // the old "next window every pass" schedule missed half the families with 3, 4, 5 or 7 windows
+        let passes = 6 * 3 * 7 * 2;
+        for window_count in 2..=8i64 {
+            for static_window in 0..window_count {
+                for march_every in 1..=3u32 {
+                    let mut seen =
+                        vec![[false; PATTERN_FAMILY_COUNT as usize]; window_count as usize];
+                    let mut march_passes = 0;
+                    for iteration in 1..=passes {
+                        if let Some(window) =
+                            march_window_for(iteration, window_count, static_window, march_every)
+                        {
+                            assert_ne!(window, static_window);
+                            let family = pattern_for(iteration, window as u32, true) & 0xFF;
+                            seen[window as usize][family as usize] = true;
+                            march_passes += 1;
+                        }
+                    }
+                    for window in (0..window_count).filter(|w| *w != static_window) {
+                        assert!(
+                            seen[window as usize].iter().all(|s| *s),
+                            "{window_count} windows, static {static_window}, every {march_every}: window {window} saw {:?}",
+                            seen[window as usize]
+                        );
+                    }
+                    assert_eq!(march_passes * march_every, passes);
+                }
+            }
+        }
+        assert_eq!(march_window_for(5, 4, 0, 0), None);
+    }
+
+    #[test]
+    fn march_dispatch_covers_whole_windows() {
+        // windows are multiples of TEST_WINDOW_SIZE_GRANULARITY; each March dispatch row covers
+        // TEST_WINDOW_1D_MAX_GROUPS threads of MARCH_VEC4_PER_THREAD vec4 each
+        let vec4_per_granule = TEST_WINDOW_SIZE_GRANULARITY / (ELEMENT_SIZE * VEC_SIZE as i64);
+        let vec4_per_row = MARCH_VEC4_PER_THREAD as i64 * TEST_WINDOW_1D_MAX_GROUPS;
+        assert_eq!(vec4_per_granule % vec4_per_row, 0);
+    }
+
+    fn feed(tracker: &mut BandwidthTracker, kind: KernelKind, dispatch_gbps: &[f64]) {
+        for gbps in dispatch_gbps {
+            tracker.add(kind, PATTERN_RANDOM, (gbps * GB as f64) as i64, Some(1.0));
+        }
+    }
+
+    #[test]
+    fn bandwidth_drop_needs_two_comparable_low_intervals_in_a_row() {
+        let mut tracker = BandwidthTracker::default();
+        let (steady, low) = ([700.0; 10], [640.0; 10]);
+        let mut warned = Vec::new();
+        for (samples, comparable) in [
+            (&steady, false),
+            (&steady, true),
+            (&low, true),
+            (&low, true),
+            (&steady, true),
+            (&low, true),
+            (&low, false), // a skipped interval breaks the streak
+            (&low, true),
+            (&low, true),
+        ] {
+            feed(&mut tracker, KernelKind::Read, samples);
+            warned.push(!tracker.finish_interval(comparable).is_empty());
+        }
+        assert_eq!(
+            warned,
+            [false, false, false, true, false, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn bandwidth_median_ignores_a_few_slow_dispatches() {
+        let mut tracker = BandwidthTracker::default();
+        feed(&mut tracker, KernelKind::Write, &[700.0; 10]);
+        assert!(tracker.finish_interval(true).is_empty());
+        let mut disturbed = vec![700.0; 8];
+        disturbed.extend([200.0; 3]); // other GPU work slowed 3 of 11 dispatches
+        for _ in 0..3 {
+            feed(&mut tracker, KernelKind::Write, &disturbed);
+            assert!(tracker.finish_interval(true).is_empty());
+        }
+    }
+
+    #[test]
+    fn bandwidth_ignores_intervals_with_too_few_dispatches() {
+        let mut tracker = BandwidthTracker::default();
+        feed(&mut tracker, KernelKind::March, &[700.0; 10]);
+        assert!(tracker.finish_interval(true).is_empty());
+        for _ in 0..3 {
+            feed(
+                &mut tracker,
+                KernelKind::March,
+                &[300.0; BANDWIDTH_MIN_DISPATCHES - 1],
+            );
+            assert!(tracker.finish_interval(true).is_empty());
+        }
+    }
+
+    fn clock_stats(samples: &[(u32, u64)]) -> telemetry::IntervalStats {
+        let mut stats = telemetry::IntervalStats::default();
+        for &(mem_clock, reasons) in samples {
+            stats.add(telemetry::Sample {
+                mem_clock_mhz: Some(mem_clock),
+                limit_reasons: Some(reasons),
+                ..Default::default()
+            });
+        }
+        stats
+    }
+
+    #[test]
+    fn bandwidth_warning_names_the_likely_cause() {
+        let drop = [BandwidthDrop {
+            kind: KernelKind::Read,
+            family: PATTERN_PRBS7,
+            gbps: 600.0,
+            best_gbps: 700.0,
+        }];
+        assert!(bandwidth_warning(&[], None).is_none());
+        let warning =
+            |stats: Option<&telemetry::IntervalStats>| bandwidth_warning(&drop, stats).unwrap();
+        assert!(warning(None).contains("read/prbs7 600.0GiB/s (-14.3%)"));
+        // GpuIdle (0x1) is not a clock limit
+        let steady = clock_stats(&[(13001, 0x1), (13001, 0)]);
+        assert!(warning(Some(&steady)).contains("stayed at 13001MHz with no clock limiting"));
+        let limited = clock_stats(&[(13001, 0x4), (13001, 0x40)]);
+        let limited_warning = warning(Some(&limited));
+        assert!(limited_warning.contains("stayed at 13001MHz, but"));
+        assert!(limited_warning.contains("(SwPowerCap,HwThermal)"));
+        // a varying memory clock explains a drop even when limits are also active
+        let varied = clock_stats(&[(13001, 0x4), (10501, 0)]);
+        assert!(warning(Some(&varied)).contains("varied 10501-13001MHz"));
+    }
+
+    #[test]
+    fn telemetry_status_text_shows_interval_peaks() {
+        let mut stats = telemetry::IntervalStats::default();
+        for (core, temperature, power) in [(2790, 55, 240.4), (2775, 58, 263.2), (2775, 57, 250.0)]
+        {
+            stats.add(telemetry::Sample {
+                mem_clock_mhz: Some(13001),
+                gpu_clock_mhz: Some(core),
+                temperature_c: Some(temperature),
+                power_w: Some(power),
+                limit_reasons: Some(0),
+                ecc_errors: None,
+            });
+        }
+        assert_eq!(
+            stats.status_text(),
+            " mem:13001MHz core:2775MHz max 58C 263W"
+        );
+        assert_eq!(telemetry::IntervalStats::default().status_text(), "");
     }
 
     #[test]

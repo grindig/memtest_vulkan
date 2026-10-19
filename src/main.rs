@@ -1176,7 +1176,7 @@ impl StatusColumn {
             StatusColumn::Power => ("power", 5, false),
             StatusColumn::Limit => ("limit", 13, true),
             StatusColumn::CoreTemp => ("coreT", 5, false),
-            StatusColumn::Tested => ("tested", 7, false),
+            StatusColumn::Tested => ("tested", 8, false),
         };
         console::Column {
             header,
@@ -1215,39 +1215,6 @@ fn status_columns(
     columns
 }
 
-fn status_legend(columns: &[StatusColumn], gpu_timed: bool) -> String {
-    use StatusColumn::*;
-    let speeds: Vec<&str> = columns
-        .iter()
-        .filter_map(|column| match column {
-            Write => Some("write"),
-            Read => Some("read"),
-            March => Some("march"),
-            _ => None,
-        })
-        .collect();
-    let mut parts = vec![format!(
-        "{} = GiB/s timed on the {}",
-        speeds.join("/"),
-        if gpu_timed { "GPU" } else { "CPU" }
-    )];
-    for column in columns {
-        parts.push(
-            match column {
-                MemTemp => "memT = hottest memory junction temperature",
-                CoreTemp => "coreT = hottest GPU core temperature",
-                MemClock => "memMHz = memory clock (* = it changed, lowest shown)",
-                Power => "power = highest board power",
-                Limit => "limit = power/thermal clock limiting reported by the driver",
-                Tested => "tested = data written and read so far",
-                _ => continue,
-            }
-            .to_owned(),
-        );
-    }
-    format!("Columns: {}", parts.join("; "))
-}
-
 struct StatusValues<'a> {
     elapsed: time::Duration,
     last_error_at: Option<time::Duration>,
@@ -1258,10 +1225,23 @@ struct StatusValues<'a> {
     tested_bytes: f64,
 }
 
+/// Column names plus a second line with the units of the speed columns.
 fn status_header(columns: &[StatusColumn]) -> String {
+    use StatusColumn::*;
     let layouts: Vec<console::Column> = columns.iter().map(|c| c.layout()).collect();
     let headers: Vec<String> = layouts.iter().map(|c| c.header.to_owned()).collect();
-    console::row(&layouts, &headers)
+    let units: Vec<String> = columns
+        .iter()
+        .map(|column| match column {
+            Write | Read | March => "GiB/s".to_owned(),
+            _ => String::new(),
+        })
+        .collect();
+    format!(
+        "{}\n{}",
+        console::row(&layouts, &headers),
+        console::row(&layouts, &units)
+    )
 }
 
 fn status_row(columns: &[StatusColumn], values: &StatusValues) -> String {
@@ -1304,10 +1284,14 @@ fn status_row(columns: &[StatusColumn], values: &StatusValues) -> String {
             Limit => telemetry.map(|t| t.limit_codes()).unwrap_or_default(),
             Tested => {
                 let gib = values.tested_bytes / GB as f64;
+                let tib = gib / 1024.0;
+                // PiB from 1000TiB on keeps the value within the column (about 25 minutes at 700GiB/s)
                 if gib < 1024.0 {
-                    format!("{gib:.0}G")
+                    format!("{gib:.0}GiB")
+                } else if tib < 1000.0 {
+                    format!("{tib:.1}TiB")
                 } else {
-                    format!("{:.1}T", gib / 1024.0)
+                    format!("{:.1}PiB", tib / 1024.0)
                 }
             }
         })
@@ -1836,14 +1820,18 @@ fn test_device<Writer: std::io::Write>(
             &device_name,
         ) {
             Ok(nvml) => {
-                let temperature = match nvml.memory_temperature_missing() {
-                    None => "memory junction temperature from NVAPI".to_owned(),
-                    Some(reason) => format!("core temperature instead of memory, since {reason}"),
-                };
-                let source = format!(
-                    "Telemetry: memory clock, power, clock limits and ECC from NVML; {temperature}"
-                );
-                writeln!(log_dupler, "{}", console::wrap(&source, width))?;
+                if env.verbose() {
+                    let temperature = match nvml.memory_temperature_missing() {
+                        None => "memory junction temperature from NVAPI".to_owned(),
+                        Some(reason) => {
+                            format!("core temperature instead of memory, since {reason}")
+                        }
+                    };
+                    let source = format!(
+                        "Telemetry: memory clock, power, clock limits and ECC from NVML; {temperature}"
+                    );
+                    let _ = writeln!(log_dupler, "{}", console::wrap(&source, width));
+                }
                 Some(nvml)
             }
             Err(e) => {
@@ -1886,7 +1874,6 @@ fn test_device<Writer: std::io::Write>(
     let mut last_error_at: Option<time::Duration> = None;
     let mut tested_bytes = 0f64; // written + read since the start, March traffic included
     let mut status_header_due = true;
-    let mut status_legend_due = true;
     // The static window is written once and only re-read, which catches retention errors. It moves to
     // the next window periodically so every window gets both rewrites and long dwell times.
     let mut static_window = 0i64;
@@ -2067,11 +2054,6 @@ fn test_device<Writer: std::io::Write>(
                 status_header_due = true;
             } else {
                 if status_header_due {
-                    if status_legend_due {
-                        let legend = status_legend(&status_columns, query_pool.is_some());
-                        writeln!(log_dupler, "{}", console::wrap(&legend, width))?;
-                        status_legend_due = false;
-                    }
                     writeln!(log_dupler, "{}", status_header(&status_columns))?;
                     status_header_due = false;
                 }
@@ -3216,7 +3198,11 @@ mod tests {
         };
         for width in [39, 49, 59, 79, 99, 119, 159] {
             let columns = status_columns(true, true, true, width);
-            assert!(status_header(&columns).chars().count() <= width);
+            assert!(
+                status_header(&columns)
+                    .lines()
+                    .all(|line| line.chars().count() <= width)
+            );
             assert!(status_row(&columns, &values).chars().count() <= width);
         }
     }
@@ -3248,7 +3234,7 @@ mod tests {
         let columns = status_columns(true, true, true, 119);
         assert_eq!(
             status_row(&columns, &values),
-            "00:00:36  ERR 00:01:23   678.9   697.7       -   74C  10501*   262W  power,thermal    58C    12.3T"
+            "00:00:36  ERR 00:01:23   678.9   697.7       -   74C  10501*   262W  power,thermal    58C   12.3TiB"
         );
         let quiet = StatusValues {
             last_error_at: None,
@@ -3257,7 +3243,28 @@ mod tests {
             ..values
         };
         assert!(status_row(&columns, &quiet).starts_with("00:00:36  no errors  "));
-        assert!(status_row(&columns, &quiet).ends_with("  936G"));
+        assert!(status_row(&columns, &quiet).ends_with("  936GiB"));
+        let long_run = StatusValues {
+            tested_bytes: 2.5 * 1024.0 * 1024.0 * GB as f64, // 2.5PiB in GiB
+            ..quiet
+        };
+        assert!(status_row(&columns, &long_run).ends_with("  2.5PiB"));
+    }
+
+    #[test]
+    fn status_header_puts_units_under_the_speed_columns() {
+        let header = status_header(&status_columns(true, true, true, 119));
+        let lines: Vec<&str> = header.lines().collect();
+        assert_eq!(
+            lines[0],
+            "time      status         write    read   march  memT  memMHz  power  limit          coreT    tested"
+        );
+        assert_eq!(lines[1], format!("{}GiB/s   GiB/s   GiB/s", " ".repeat(25)));
+        // each unit ends where its column header ends
+        for name in ["write", "read", "march"] {
+            assert!(lines[0].find(name).unwrap() + name.len() <= lines[1].len());
+        }
+        assert_eq!(lines[0].find("write").unwrap() + 5, 25 + 5);
     }
 
     #[test]

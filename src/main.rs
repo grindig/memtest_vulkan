@@ -84,29 +84,128 @@ struct IOBuf
     done_iter_or_err: u32,
     iter: u32,
     calc_param: u32,
+    pattern: u32,
+    march_flags: u32,
+    reserved0: u32,
+    reserved1: u32,
     first_elem: vec4<u32>
 }
 
 @group(0) @binding(0) var<storage, read_write> io: IOBuf;
 @group(0) @binding(1) var<storage, read_write> test: array<vec4<u32>>;
 
-fn addr_value_by_index(i:u32)->vec4<u32>
+//pattern word layout: bits 0..7 family, bits 8..15 variant, bit 16 inverts the whole value
+let PATTERN_RANDOM: u32 = 1u;
+let PATTERN_SOLID: u32 = 2u;
+let PATTERN_TOGGLE: u32 = 3u;
+let PATTERN_WALKING: u32 = 4u;
+let PATTERN_PRBS7: u32 = 5u;
+let PATTERN_INVERT_BIT: u32 = 0x10000u;
+
+//PRBS7 (x^7+x^6+1) sequence: 127 bits followed by its first 33 bits, LSB-first, so any 32-bit window is readable without wrap
+fn prbs7_word(k: u32) -> u32
 {
-    let effective_index_of_u32 = i * 4u + io.calc_param;
-    return vec4<u32>(effective_index_of_u32 + 1u, effective_index_of_u32 + 2u, effective_index_of_u32 + 3u, effective_index_of_u32 + 4u);
+    return select(select(select(select(0x4F143040u, 0xFEA99DD2u, k == 3u), 0xC6F6B648u, k == 2u), 0xE17CAE68u, k == 1u), 0x9E286081u, k == 0u);
 }
 
-fn test_value_by_index(i:u32)->vec4<u32>
+fn prbs7_window(n: u32) -> u32
 {
-    let addrs : vec4<u32> = addr_value_by_index(i);
-    let shifts : vec4<u32> = addrs % 31u;
-    let rotated : vec4<u32> = (addrs << shifts) | (addrs >> (32u - shifts));
-    return rotated;
+    let w = n >> 5u;
+    let b = n & 31u;
+    let lo = prbs7_word(w) >> b;
+    let hi = select(prbs7_word(w + 1u) << ((32u - b) & 31u), 0u, b == 0u);
+    return lo | hi;
 }
 
+fn pattern_u32(e: u32, p: u32, pattern: u32) -> u32
+{
+    let family = pattern & 0xFFu;
+    let variant = (pattern >> 8u) & 0xFFu;
+    var value: u32 = 0u;
+    if family == PATTERN_RANDOM {
+        //lowbias32 hash of a per-pass bijection of the index: high entropy, still unique per address
+        var x: u32 = (e * 0x9E3779B1u) ^ p;
+        x = x ^ (x >> 16u);
+        x = x * 0x7FEB352Du;
+        x = x ^ (x >> 15u);
+        x = x * 0x846CA68Bu;
+        value = x ^ (x >> 16u);
+    } else if family == PATTERN_SOLID {
+        value = 0u;
+    } else if family == PATTERN_TOGGLE {
+        //bytes with exactly 4 zero bits are left alone by GDDR DBI-DC, so their complement swaps toggle every lane
+        let base_idx = variant % 3u;
+        let base = select(select(0x55555555u, 0x33333333u, base_idx == 1u), 0x0F0F0F0Fu, base_idx == 0u);
+        let mode = (variant / 3u) % 5u;
+        if mode == 0u {
+            value = base ^ 0xFFFF0000u;
+        } else {
+            value = base ^ select(0u, 0xFFFFFFFFu, ((e >> (mode - 1u)) & 1u) == 1u);
+        }
+    } else if family == PATTERN_WALKING {
+        let pos = e + p;
+        if (variant & 1u) == 0u {
+            value = 1u << (pos % 32u);
+        } else {
+            value = 0x01010101u << (pos % 8u);
+        }
+    } else if family == PATTERN_PRBS7 {
+        value = prbs7_window((e + p) % 127u);
+    } else {
+        //original memtest_vulkan pattern: address rotated by itself
+        let a = e + p + 1u;
+        let shift = a % 31u;
+        value = (a << shift) | (a >> (32u - shift));
+    }
+    if (pattern & PATTERN_INVERT_BIT) != 0u {
+        value = value ^ 0xFFFFFFFFu;
+    }
+    return value;
+}
+
+fn test_value_by_index(i: u32, p: u32, pattern: u32)->vec4<u32>
+{
+    let e = i * 4u;
+    return vec4<u32>(pattern_u32(e, p, pattern), pattern_u32(e + 1u, p, pattern), pattern_u32(e + 2u, p, pattern), pattern_u32(e + 3u, p, pattern));
+}
+
+//slow path, executed only on errors found
+fn record_errors(effective_addr: u32, actual_value: vec4<u32>, expected_value: vec4<u32>)
+{
+    for(var i: i32 = 0; i < 4; i++) {
+        let actual_u32 = actual_value[i];
+        let error_mask = actual_u32 ^ expected_value[i];
+        if error_mask == 0u {
+            continue;
+        }
+        let one_bits = countOneBits(error_mask);
+        if one_bits == 1u
+        {
+            let bit_idx = firstLeadingBit(error_mask);
+            atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
+        }
+        atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
+        let vec_addr: u32 = effective_addr * 4u + u32(i);
+        atomicMax(&io.idx_max, vec_addr);
+        atomicMin(&io.idx_min, vec_addr);
+        atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
+        let actual_bits = countOneBits(actual_u32);
+        if actual_bits == 32u
+        {
+            atomicAdd(&io.actual_ff, 1u);
+        }
+        else
+        {
+            atomicAdd(&io.mem_bitcount[actual_bits], 1u);
+            atomicMax(&io.actual_max, actual_u32);
+            atomicMin(&io.actual_min, actual_u32);
+        }
+    }
+}
 
 let TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
 let TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
+let MARCH_VEC4_PER_THREAD: u32 = 16u;
 
 @compute @workgroup_size(64, 1, 1)
 fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
@@ -115,38 +214,9 @@ fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let new_mod = (11 * effective_invocation_id + 999 * io.iter + io.calc_param +  7 * (effective_invocation_id / TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY)) % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
     let effective_addr = effective_invocation_id - addr_mod + new_mod; //make read order a bit rotated, not strictly sequential
     let actual_value : vec4<u32> = test[effective_addr];
-    let expected_value : vec4<u32> = test_value_by_index(effective_addr);
+    let expected_value : vec4<u32> = test_value_by_index(effective_addr, io.calc_param, io.pattern);
     if any(actual_value != expected_value) {
-        //slow path, executed only on errors found
-        for(var i: i32 = 0; i < 4; i++) {
-            let actual_u32 = actual_value[i];
-            let error_mask = actual_u32 ^ expected_value[i];
-            if error_mask == 0 {
-                continue;
-            }
-            let one_bits = countOneBits(error_mask);
-            if one_bits == 1
-            {
-                let bit_idx = firstLeadingBit(error_mask);
-                atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
-            }
-            atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
-            let vec_addr: u32 = effective_addr * 4u + i;
-            atomicMax(&io.idx_max, vec_addr);
-            atomicMin(&io.idx_min, vec_addr);
-            atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
-            let actual_bits = countOneBits(actual_u32);
-            if actual_bits == 32
-            {
-                atomicAdd(&io.actual_ff, 1u);
-            }
-            else
-            {
-                atomicAdd(&io.mem_bitcount[actual_bits], 1u);
-                atomicMax(&io.actual_max, actual_u32);
-                atomicMin(&io.actual_min, actual_u32);
-            }
-        }
+        record_errors(effective_addr, actual_value, expected_value);
     }
     //assign done_iter_or_err only on specific index (performance reasons)
     if effective_addr == 0 {
@@ -163,7 +233,7 @@ fn write(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
     let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
     let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
-    test[proccessed_idx] = test_value_by_index(proccessed_idx);
+    test[proccessed_idx] = test_value_by_index(proccessed_idx, io.calc_param, io.pattern);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -172,9 +242,41 @@ fn emulate_write_bugs(@builtin(global_invocation_id) global_invocation_id: vec3<
     let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
     let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
     let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
-    test[proccessed_idx] = test_value_by_index(proccessed_idx);
-    if proccessed_idx == 0xADBA {
+    test[proccessed_idx] = test_value_by_index(proccessed_idx, io.calc_param, io.pattern);
+    if proccessed_idx == 0xADBAu {
         test[proccessed_idx][1] ^= 0x400000u;//error simulation for test
+    } else if proccessed_idx == 0xADBBu {
+        test[proccessed_idx] = vec4<u32>(0xFFFFFFFFu);//all-ones words, like a dead channel
+    }
+}
+
+//One March C- element over the window: every cell is read, checked against the pattern (or its complement)
+//and immediately overwritten with the opposite value, so reads and writes share the bus.
+//Each workgroup walks its own contiguous chunk with coalesced 1KB steps; descending mode reverses chunks, steps and lanes.
+@compute @workgroup_size(64, 1, 1)
+fn march(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>, @builtin(local_invocation_index) local_index: u32) {
+    let p = io.calc_param;
+    let pattern = io.pattern;
+    let read_inverted = (io.march_flags & 1u) != 0u;
+    let descending = (io.march_flags & 2u) != 0u;
+    let group_count = num_workgroups[0] * num_workgroups[1];
+    let linear_group = workgroup_id[0] + workgroup_id[1] * num_workgroups[0];
+    let group = select(linear_group, group_count - 1u - linear_group, descending);
+    let lane = select(local_index, 63u - local_index, descending);
+    let read_mask = select(vec4<u32>(0u), vec4<u32>(0xFFFFFFFFu), vec4<bool>(read_inverted));
+    let chunk_base = group * 64u * MARCH_VEC4_PER_THREAD;
+    for(var j: u32 = 0u; j < MARCH_VEC4_PER_THREAD; j++) {
+        let step = select(j, MARCH_VEC4_PER_THREAD - 1u - j, descending);
+        let idx = chunk_base + step * 64u + lane;
+        let expected_value = test_value_by_index(idx, p, pattern) ^ read_mask;
+        let actual_value = test[idx];
+        if any(actual_value != expected_value) {
+            record_errors(idx, actual_value, expected_value);
+        }
+        test[idx] = expected_value ^ vec4<u32>(0xFFFFFFFFu);
+        if idx == 0u {
+            atomicMax(&io.done_iter_or_err, io.iter);
+        }
     }
 }
 "#
@@ -194,12 +296,143 @@ const ALLOCATION_TRY_STEP: i64 = TEST_DATA_KEEP_FREE;
 
 const MAP_FOR_GETTING_ADDRESS_SIZE: u64 = 2 * 1024 * 1024; // signle huge page
 
+const MARCH_VEC4_PER_THREAD: u32 = 16; // keep in sync with the shader constant
+// March C- elements after the write pass: up(r0,w1) up(r1,w0) down(r0,w1) down(r1,w0); the read pass is the final r0
+const MARCH_ELEMENTS: [(u32, &str); 4] = [
+    (0b00, "MARCH_UP_R0W1"),
+    (0b01, "MARCH_UP_R1W0"),
+    (0b10, "MARCH_DOWN_R0W1"),
+    (0b11, "MARCH_DOWN_R1W0"),
+];
+// how long one window keeps its data untouched for retention checking before another window takes over
+const STATIC_WINDOW_ROTATE_PERIOD: time::Duration = time::Duration::from_secs(60);
+// GPU-timed bandwidth this far below the best seen for the same kernel+pattern, two reports in a row, is reported
+const BANDWIDTH_DROP_THRESHOLD: f64 = 0.05;
+
+const PATTERN_ADDR_ROTATE: u32 = 0;
+const PATTERN_RANDOM: u32 = 1;
+const PATTERN_SOLID: u32 = 2;
+const PATTERN_TOGGLE: u32 = 3;
+const PATTERN_WALKING: u32 = 4;
+const PATTERN_PRBS7: u32 = 5;
+const PATTERN_FAMILY_COUNT: u32 = 6;
+const PATTERN_INVERT_BIT: u32 = 0x10000;
+const PATTERN_NAMES: [&str; PATTERN_FAMILY_COUNT as usize] = [
+    "addr_rotate",
+    "random",
+    "solid",
+    "toggle",
+    "walking",
+    "prbs7",
+];
+// same table as in the shader: PRBS7 sequence followed by its first 33 bits, LSB-first
+const PRBS7_WORDS: [u32; 5] = [0x9E286081, 0xE17CAE68, 0xC6F6B648, 0xFEA99DD2, 0x4F143040];
+
+fn prbs7_window(n: u32) -> u32 {
+    let w = (n >> 5) as usize;
+    let b = n & 31;
+    let lo = PRBS7_WORDS[w] >> b;
+    let hi = if b == 0 {
+        0
+    } else {
+        PRBS7_WORDS[w + 1] << (32 - b)
+    };
+    lo | hi
+}
+
+/// CPU mirror of the shader `pattern_u32`, used to sanity-check shader execution.
+#[allow(clippy::manual_rotate)] // kept as similar to WGSL shader above as possible
+fn pattern_u32(e: u32, p: u32, pattern: u32) -> u32 {
+    let variant = (pattern >> 8) & 0xFF;
+    let value = match pattern & 0xFF {
+        PATTERN_RANDOM => {
+            let mut x = e.wrapping_mul(0x9E3779B1) ^ p;
+            x ^= x >> 16;
+            x = x.wrapping_mul(0x7FEB352D);
+            x ^= x >> 15;
+            x = x.wrapping_mul(0x846CA68B);
+            x ^ (x >> 16)
+        }
+        PATTERN_SOLID => 0,
+        PATTERN_TOGGLE => {
+            let base = [0x0F0F0F0F, 0x33333333, 0x55555555][(variant % 3) as usize];
+            match (variant / 3) % 5 {
+                0 => base ^ 0xFFFF0000,
+                mode => {
+                    base ^ if (e >> (mode - 1)) & 1 == 1 {
+                        0xFFFFFFFF
+                    } else {
+                        0
+                    }
+                }
+            }
+        }
+        PATTERN_WALKING => {
+            let pos = e.wrapping_add(p);
+            if variant & 1 == 0 {
+                1 << (pos % 32)
+            } else {
+                0x01010101 << (pos % 8)
+            }
+        }
+        PATTERN_PRBS7 => prbs7_window(e.wrapping_add(p) % 127),
+        _ => {
+            let a = e.wrapping_add(p).wrapping_add(1);
+            let shift = a % 31;
+            if shift > 0 {
+                a << shift | a >> (32 - shift)
+            } else {
+                a
+            }
+        }
+    };
+    if pattern & PATTERN_INVERT_BIT != 0 {
+        !value
+    } else {
+        value
+    }
+}
+
+/// Pattern for a window in a given iteration. Neighbouring windows and consecutive iterations get
+/// different families, so a dropped write never leaves a value that still matches.
+fn pattern_for(iter: u32, window_idx: u32, extended: bool) -> u32 {
+    if !extended {
+        return PATTERN_ADDR_ROTATE;
+    }
+    let slot = iter.wrapping_add(window_idx);
+    let family = slot % PATTERN_FAMILY_COUNT;
+    let round = slot / PATTERN_FAMILY_COUNT;
+    let invert = if round & 1 == 1 {
+        PATTERN_INVERT_BIT
+    } else {
+        0
+    };
+    let variant = ((round >> 1) & 0xFF) << 8;
+    family | variant | invert
+}
+
+fn pattern_name(pattern: u32) -> String {
+    format!(
+        "{}{}/v{}",
+        PATTERN_NAMES
+            .get((pattern & 0xFF) as usize)
+            .unwrap_or(&"unknown"),
+        if pattern & PATTERN_INVERT_BIT != 0 {
+            "~"
+        } else {
+            ""
+        },
+        (pattern >> 8) & 0xFF
+    )
+}
+
 struct ComputePipelines {
     read: vk::Pipeline,
     #[allow(dead_code)]
     write: vk::Pipeline,
     #[allow(dead_code)]
     emulate_write_bugs: vk::Pipeline,
+    march: vk::Pipeline,
 }
 #[derive(Default)]
 struct U64HexDebug(i64);
@@ -299,6 +532,10 @@ struct IOBuf {
     done_iter_or_err: u32,
     iter: u32,
     calc_param: u32,
+    pattern: u32,
+    march_flags: u32,
+    reserved0: u32, // padding: first_elem is a vec4 and must stay 16-byte aligned like in WGSL
+    reserved1: u32,
     first_elem: MostlyZeroArr<VEC_SIZE>,
 }
 
@@ -306,8 +543,11 @@ impl fmt::Display for IOBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "values range: 0x{:08X}..=0x{:08X}   FFFFFFFF-like count:{}    bit-level stats table:",
-            self.actual_max, self.actual_min, self.actual_ff
+            "values range: 0x{:08X}..=0x{:08X}   FFFFFFFF-like count:{}   pattern:{}    bit-level stats table:",
+            self.actual_max,
+            self.actual_min,
+            self.actual_ff,
+            pattern_name(self.pattern)
         )?;
         writeln!(
             f,
@@ -334,10 +574,22 @@ impl IOBuf {
     fn set_calc_param_for_starting_window(&mut self) {
         self.calc_param = self.iter.wrapping_mul(0x100107);
     }
+    /// Clean copy describing what `window_idx` holds after this iteration's write pass.
+    fn for_window(&self, window_idx: i64, extended: bool) -> Self {
+        let mut result = *self;
+        result.reset_errors();
+        result.set_calc_param_for_starting_window();
+        result.calc_param = result.calc_param.wrapping_add(window_idx as u32 * 0x81_u32);
+        result.pattern = pattern_for(self.iter, window_idx as u32, extended);
+        result.march_flags = 0;
+        result
+    }
     fn reset_errors(&mut self) {
         *self = IOBuf {
             iter: self.iter,
             calc_param: self.calc_param,
+            pattern: self.pattern,
+            march_flags: self.march_flags,
             idx_max: u32::MIN,
             idx_min: u32::MAX,
             actual_max: u32::MIN,
@@ -352,7 +604,9 @@ impl IOBuf {
         if self.done_iter_or_err == self.iter {
             None
         } else {
-            let total_errors = self.mem_bitcount.0.iter().sum::<u32>() as i64;
+            // words read back as all-ones are counted in actual_ff instead of mem_bitcount
+            let total_errors =
+                self.mem_bitcount.0.iter().sum::<u32>() as i64 + self.actual_ff as i64;
             Some((
                 std::ops::RangeInclusive::<U64HexDebug>::new(
                     U64HexDebug(buf_offset + self.idx_min as i64 * ELEMENT_SIZE),
@@ -362,19 +616,15 @@ impl IOBuf {
             ))
         }
     }
-    #[allow(clippy::manual_rotate)] // this is kept as similar to WGSL shader above as possible
     fn check_vec_first(&self) -> Result<(), Box<dyn std::error::Error>> {
         const TEST_IDX: u32 = 1;
-        let addr: u32 = TEST_IDX * VEC_SIZE as u32 + self.calc_param + 1u32;
-        let shift = addr % 31u32;
-        let rotated = if shift > 0 {
-            addr << shift | addr >> (32 - shift)
-        } else {
-            addr
-        };
-        if rotated != self.first_elem.0[0] {
-            println!("{} 0x{:08X}", self, rotated);
-            return Err("unexpected calculated value, maybe shader execution is broken".into());
+        for lane in 0..VEC_SIZE {
+            let e = TEST_IDX * VEC_SIZE as u32 + lane as u32;
+            let expected = pattern_u32(e, self.calc_param, self.pattern);
+            if expected != self.first_elem.0[lane] {
+                println!("{} 0x{:08X}", self, expected);
+                return Err("unexpected calculated value, maybe shader execution is broken".into());
+            }
         }
         Ok(())
     }
@@ -521,15 +771,15 @@ fn memory_requirements(
 
 fn free_test_mem_and_buffers(
     device: &erupt::DeviceLoader,
-    buffer: &mut Option<vk::Buffer>,
-    memory: &mut Option<vk::DeviceMemory>,
+    buffers: &mut Vec<vk::Buffer>,
+    memories: &mut Vec<vk::DeviceMemory>,
 ) {
-    if let Some(some_buffer) = buffer.take() {
+    for some_buffer in buffers.drain(..) {
         unsafe {
             device.destroy_buffer(some_buffer, None);
         }
     }
-    if let Some(some_memory) = memory.take() {
+    for some_memory in memories.drain(..) {
         unsafe {
             device.free_memory(some_memory, None);
         }
@@ -670,6 +920,7 @@ fn prepare_and_test_device<Writer: std::io::Write>(
         c_str!("read"),
         c_str!("write"),
         c_str!("emulate_write_bugs"),
+        c_str!("march"),
     ]
     .map(|name| {
         let shader_stage = vk::PipelineShaderStageCreateInfoBuilder::new()
@@ -688,6 +939,7 @@ fn prepare_and_test_device<Writer: std::io::Write>(
         read: pipelines[0],
         write: pipelines[1],
         emulate_write_bugs: pipelines[2],
+        march: pipelines[3],
     };
 
     if let Err(e) = test_device(
@@ -701,11 +953,168 @@ fn prepare_and_test_device<Writer: std::io::Write>(
         &selected.label,
         selected.memory_props,
         selected.physical_props,
+        selected.max_memory_allocation_size,
+        selected.timestamp_valid_bits,
         env,
     ) {
         display_this_process_result(Some(e), env)
     }
     display_this_process_result(None, env)
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum KernelKind {
+    Write,
+    Read,
+    March,
+}
+
+impl KernelKind {
+    const COUNT: usize = 3;
+    fn name(self) -> &'static str {
+        match self {
+            KernelKind::Write => "write",
+            KernelKind::Read => "read",
+            KernelKind::March => "march",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Default)]
+struct BandwidthSample {
+    bytes: f64,
+    secs: f64,
+}
+
+impl BandwidthSample {
+    fn gbps(&self) -> Option<f64> {
+        (self.secs > 0.0).then(|| self.bytes / GB as f64 / self.secs)
+    }
+}
+
+#[derive(Default)]
+struct BandwidthHistory {
+    best_gbps: f64,
+    low_reports: u32,
+    interval: BandwidthSample,
+}
+
+/// GPU-timed bandwidth per kernel and pattern family. Link EDC retries on unstable GDDR
+/// don't produce data errors, only lost bandwidth, so a sustained drop is worth reporting.
+#[derive(Default)]
+struct BandwidthTracker {
+    history: std::collections::BTreeMap<(KernelKind, u32), BandwidthHistory>,
+    totals: [BandwidthSample; KernelKind::COUNT],
+}
+
+impl BandwidthTracker {
+    fn add(&mut self, kind: KernelKind, pattern: u32, bytes: i64, gpu_secs: Option<f64>) {
+        let Some(secs) = gpu_secs.filter(|s| *s > 0.0) else {
+            return;
+        };
+        let entry = self.history.entry((kind, pattern & 0xFF)).or_default();
+        entry.interval.bytes += bytes as f64;
+        entry.interval.secs += secs;
+        self.totals[kind as usize].bytes += bytes as f64;
+        self.totals[kind as usize].secs += secs;
+    }
+    fn interval_gbps(&self, kind: KernelKind) -> Option<f64> {
+        self.totals[kind as usize].gbps()
+    }
+    /// Closes the report interval. Only full-length intervals are compared against the best seen.
+    fn finish_interval(&mut self, comparable: bool) -> Option<String> {
+        let mut dropped = Vec::new();
+        for (&(kind, family), entry) in self.history.iter_mut() {
+            let sample = mem::take(&mut entry.interval);
+            let Some(gbps) = sample.gbps().filter(|_| comparable) else {
+                continue;
+            };
+            if entry.best_gbps > 0.0 && gbps < entry.best_gbps * (1.0 - BANDWIDTH_DROP_THRESHOLD) {
+                entry.low_reports += 1;
+                if entry.low_reports >= 2 {
+                    dropped.push(format!(
+                        "{}/{} {:.1}GB/s ({:+.1}%)",
+                        kind.name(),
+                        PATTERN_NAMES.get(family as usize).unwrap_or(&"unknown"),
+                        gbps,
+                        (gbps / entry.best_gbps - 1.0) * 100.0
+                    ));
+                }
+            } else {
+                entry.low_reports = 0;
+            }
+            entry.best_gbps = entry.best_gbps.max(gbps);
+        }
+        self.totals = Default::default();
+        if dropped.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "BANDWIDTH DROP: more than {:.0}% below best for 2+ reports: {}. If the memory clock is steady this points to link EDC retries (unstable memory), otherwise to thermal or power throttling.",
+            BANDWIDTH_DROP_THRESHOLD * 100.0,
+            dropped.join(", ")
+        ))
+    }
+}
+
+fn report_window_errors<Writer: std::io::Write>(
+    log_dupler: &mut output::LogDupler<Writer>,
+    buffer_out: &IOBuf,
+    test_offset: i64,
+    test_window_size: i64,
+    mode: &str,
+    first_iter_start: time::Instant,
+    last_error_state: &mut String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((error_range, total_errors)) = buffer_out.get_error_addresses_and_count(test_offset)
+    {
+        *last_error_state = format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
+        close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
+        let test_elems = test_window_size / ELEMENT_SIZE;
+        write!(
+            log_dupler,
+            "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}",
+            mode,
+            total_errors,
+            test_elems,
+            total_errors as f64 / test_elems as f64 * 100.0f64,
+            error_range,
+        )?;
+        writeln!(
+            log_dupler,
+            "  iteration:{}\n{}",
+            buffer_out.iter, buffer_out
+        )?;
+    }
+    Ok(())
+}
+
+fn allocate_test_windows(
+    device: &erupt::DeviceLoader,
+    buffer_create_info: vk::BufferCreateInfoBuilder<'_>,
+    memory_type_index: u32,
+    window_count: i64,
+    window_size: i64,
+    env: &ProcessEnv,
+    buffers: &mut Vec<vk::Buffer>,
+    memories: &mut Vec<vk::DeviceMemory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..window_count {
+        let buffer =
+            unsafe { device.create_buffer(&buffer_create_info.size(window_size as u64), None) }
+                .err_retry_with_lower_memory(env, "create_buffer")?;
+        buffers.push(buffer);
+        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let allocate_info = vk::MemoryAllocateInfoBuilder::new()
+            .allocation_size(reqs.size)
+            .memory_type_index(memory_type_index);
+        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
+            .err_retry_with_lower_memory(env, "allocate_memory")?;
+        memories.push(memory);
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .err_retry_with_lower_memory(env, "bind_buffer_memory")?;
+    }
+    Ok(())
 }
 
 fn test_device<Writer: std::io::Write>(
@@ -719,12 +1128,17 @@ fn test_device<Writer: std::io::Write>(
     selected_label: &String,
     memory_props: vk::PhysicalDeviceMemoryProperties,
     physical_props: vk::PhysicalDeviceProperties,
+    max_memory_allocation_size: u64,
+    timestamp_valid_bits: u32,
     env: &ProcessEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut allocation_size = env.max_test_bytes.load(SeqCst);
     if allocation_size < MIN_WANTED_ALLOCATION {
         return Err("requested test size is smaller than minimum wanted".into());
     }
+    // MEMTEST_VULKAN_MODE=classic keeps the original single-pattern test without March passes
+    let extended =
+        !env::var("MEMTEST_VULKAN_MODE").is_ok_and(|mode| mode.eq_ignore_ascii_case("classic"));
 
     let io_data_size = mem::size_of::<IOBuf>() as vk::DeviceSize;
 
@@ -827,11 +1241,59 @@ fn test_device<Writer: std::io::Write>(
     let fence =
         unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.err_as_str()?;
 
-    let submit_info = &[vk::SubmitInfoBuilder::new().command_buffers(&cmd_bufs)];
-    //all preparations except huge buffer allocation done. Now allocate huge buffer as a last step to minize chance of allocation failure for small structures
+    // GPU-side timing of every dispatch; without it speeds fall back to CPU wall-clock
+    let timestamp_period_ns = physical_props.limits.timestamp_period as f64;
+    let query_pool = if timestamp_valid_bits > 0 && timestamp_period_ns > 0.0 {
+        unsafe {
+            device.create_query_pool(
+                &vk::QueryPoolCreateInfoBuilder::new()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )
+        }
+        .err_as_str()
+        .ok()
+    } else {
+        None
+    };
+    let timestamp_mask = if timestamp_valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << timestamp_valid_bits) - 1
+    };
 
-    let mut test_memory = None;
-    let mut test_buffer = None;
+    let submit_info = &[vk::SubmitInfoBuilder::new().command_buffers(&cmd_bufs)];
+
+    // Every window is its own allocation and buffer, so a driver cap on a single allocation
+    // no longer limits the whole test to ~3.5GB.
+    let mut max_window_size = TEST_WINDOW_MAX_SIZE;
+    if max_memory_allocation_size > 0 {
+        max_window_size = min(
+            max_window_size,
+            min(max_memory_allocation_size, i64::MAX as u64) as i64,
+        );
+    }
+    max_window_size = min(
+        max_window_size,
+        physical_props.limits.max_storage_buffer_range as i64,
+    );
+    max_window_size -= max_window_size % TEST_WINDOW_SIZE_GRANULARITY;
+    max_window_size = max(max_window_size, TEST_WINDOW_SIZE_GRANULARITY);
+    if env.verbose() {
+        let _ = writeln!(
+            log_dupler,
+            "maxMemoryAllocationSize {:5.1}GB maxStorageBufferRange {:5.1}GB -> window size limit {:5.3}GB, timestamps {}",
+            max_memory_allocation_size as f32 / GB,
+            physical_props.limits.max_storage_buffer_range as f32 / GB,
+            max_window_size as f32 / GB,
+            if query_pool.is_some() { "on" } else { "off" },
+        );
+    }
+
+    //all preparations except huge buffer allocation done. Now allocate huge buffers as a last step to minize chance of allocation failure for small structures
+    let mut test_memories: Vec<vk::DeviceMemory> = Vec::new();
+    let mut test_buffers: Vec<vk::Buffer> = Vec::new();
     let mut test_window_count;
     let mut test_window_size;
     let mut warn_on_budget_alloc_fail = true;
@@ -841,116 +1303,149 @@ fn test_device<Writer: std::io::Write>(
     let mut last_err: Box<dyn std::error::Error> =
         "No heap reports memory enough for testing".into();
     'memsize: loop {
-        free_test_mem_and_buffers(device, &mut test_buffer, &mut test_memory);
+        free_test_mem_and_buffers(device, &mut test_buffers, &mut test_memories);
 
         if allocation_size < MIN_WANTED_ALLOCATION {
             return Err(last_err);
         }
 
-        let test_memory_allocate_info = vk::MemoryAllocateInfoBuilder::new()
-            .allocation_size(allocation_size as u64)
-            .memory_type_index(test_mem_index);
+        test_window_count =
+            allocation_size / max_window_size + i64::from(allocation_size % max_window_size != 0);
+        test_window_count = max(test_window_count, 2); //at least 2 windows: for testing rereads and rws
+        test_window_size = allocation_size / test_window_count;
+        test_window_size = test_window_size - test_window_size % TEST_WINDOW_SIZE_GRANULARITY;
         if env.verbose() {
             let _ = writeln!(
                 log_dupler,
-                "Trying {:7.3}GB buffer...",
-                allocation_size as f32 / GB
+                "Trying {:7.3}GB as {} windows of {:5.3}GB...",
+                allocation_size as f32 / GB,
+                test_window_count,
+                test_window_size as f32 / GB
             );
         }
-        match unsafe { device.allocate_memory(&test_memory_allocate_info, None) }
-            .err_retry_with_lower_memory(env, "allocate_memory")
-        {
+        match allocate_test_windows(
+            device,
+            test_buffer_create_info,
+            test_mem_index,
+            test_window_count,
+            test_window_size,
+            env,
+            &mut test_buffers,
+            &mut test_memories,
+        ) {
             Err(err) => last_err = err,
-            Ok(some_memory) => {
-                test_memory = Some(some_memory);
-                test_window_count = allocation_size / TEST_WINDOW_MAX_SIZE
-                    + i64::from(allocation_size % TEST_WINDOW_MAX_SIZE != 0);
-                test_window_count = max(test_window_count, 2); //at least 2 windows: for testing rereads and rws
-                test_window_size = allocation_size / test_window_count;
-                test_window_size =
-                    test_window_size - test_window_size % TEST_WINDOW_SIZE_GRANULARITY;
-                let test_data_size = test_window_size * test_window_count;
-
-                match unsafe {
-                    device.create_buffer(&test_buffer_create_info.size(test_data_size as u64), None)
-                }
-                .err_retry_with_lower_memory(env, "create_buffer")
-                {
-                    Err(err) => last_err = err,
-                    Ok(some_buffer) => {
-                        test_buffer = Some(some_buffer);
-                        match unsafe { device.bind_buffer_memory(some_buffer, some_memory, 0) }
-                            .err_retry_with_lower_memory(env, "bind_buffer_memory")
-                        {
-                            Err(err) => last_err = err,
-                            Ok(_) => {
-                                execute_wait_queue = |buf_offset: i64, pipeline: vk::Pipeline| -> Result<(), Box<dyn std::error::Error>> {
-                                    let test_element_count = (test_window_size / ELEMENT_SIZE) as u32;
-                                    unsafe {
-                                        device.update_descriptor_sets(
-                                            &[vk::WriteDescriptorSetBuilder::new()
-                                                .dst_set(desc_sets[0])
-                                                .dst_binding(1)
-                                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                                .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
-                                                    .buffer(test_buffer.unwrap())
-                                                    .offset(buf_offset as u64)
-                                                    .range(test_window_size as u64)])],
-                                            &[],
-                                        );
-                                        let cmd_buf = cmd_bufs[0];
-                                        device
-                                            .begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default())
-                                            .err_retry_with_lower_memory(env, "begin_command_buffer")?;
-                                        device.cmd_bind_pipeline(cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline);
-                                        device.cmd_bind_descriptor_sets(
-                                            cmd_buf,
-                                            vk::PipelineBindPoint::COMPUTE,
-                                            *pipeline_layout,
-                                            0,
-                                            &desc_sets,
-                                            &[],
-                                        );
-                                        device.cmd_dispatch(
-                                            cmd_buf,
-                                            (TEST_WINDOW_1D_MAX_GROUPS / WG_SIZE) as u32,
-                                            test_element_count / VEC_SIZE as u32 / TEST_WINDOW_1D_MAX_GROUPS as u32,
-                                            1,
-                                        );
-                                        device.end_command_buffer(cmd_buf).err_retry_with_lower_memory(env, "end_command_buffer")?;
-                                        device
-                                            .queue_submit(queue, submit_info, fence)
-                                            .err_retry_with_lower_memory(env, "queue_submit")?;
-                                        device
-                                            .wait_for_fences(&[fence], true, u64::MAX)
-                                            .err_retry_with_lower_memory(env, "wait_for_fences")?;
-                                        device.reset_fences(&[fence]).err_retry_with_lower_memory(env, "reset_fences")?;
-                                        Ok(())
-                                    }
-                                };
-                                unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
-                                //try to do initial memory fill to verify that allocation is really usable
-                                let mut overall_exec_result = Ok(());
-                                'window: for window_idx in 0..test_window_count {
-                                    let test_offset = test_window_size * window_idx;
-                                    if let Err(e) = execute_wait_queue(test_offset, pipelines.write)
-                                    {
-                                        overall_exec_result = Err(e);
-                                        break 'window;
-                                    }
-                                    if let Err(e) = execute_wait_queue(test_offset, pipelines.read)
-                                    {
-                                        overall_exec_result = Err(e);
-                                        break 'window;
-                                    }
-                                }
-                                match overall_exec_result {
-                                    Err(e) => last_err = e,
-                                    Ok(()) => break 'memsize,
-                                }
+            Ok(()) => {
+                execute_wait_queue =
+                    |window_idx: i64,
+                     pipeline: vk::Pipeline,
+                     vec4_per_thread: u32|
+                     -> Result<Option<f64>, Box<dyn std::error::Error>> {
+                        let test_vec4_count =
+                            (test_window_size / ELEMENT_SIZE) as u32 / VEC_SIZE as u32;
+                        unsafe {
+                            device.update_descriptor_sets(
+                                &[vk::WriteDescriptorSetBuilder::new()
+                                    .dst_set(desc_sets[0])
+                                    .dst_binding(1)
+                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                    .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                                        .buffer(test_buffers[window_idx as usize])
+                                        .offset(0)
+                                        .range(test_window_size as u64)])],
+                                &[],
+                            );
+                            let cmd_buf = cmd_bufs[0];
+                            device
+                                .begin_command_buffer(
+                                    cmd_buf,
+                                    &vk::CommandBufferBeginInfo::default(),
+                                )
+                                .err_retry_with_lower_memory(env, "begin_command_buffer")?;
+                            if let Some(pool) = query_pool {
+                                device.cmd_reset_query_pool(cmd_buf, pool, 0, 2);
+                                device.cmd_write_timestamp(
+                                    cmd_buf,
+                                    vk::PipelineStageFlagBits::TOP_OF_PIPE,
+                                    pool,
+                                    0,
+                                );
                             }
+                            device.cmd_bind_pipeline(
+                                cmd_buf,
+                                vk::PipelineBindPoint::COMPUTE,
+                                pipeline,
+                            );
+                            device.cmd_bind_descriptor_sets(
+                                cmd_buf,
+                                vk::PipelineBindPoint::COMPUTE,
+                                *pipeline_layout,
+                                0,
+                                &desc_sets,
+                                &[],
+                            );
+                            device.cmd_dispatch(
+                                cmd_buf,
+                                (TEST_WINDOW_1D_MAX_GROUPS / WG_SIZE) as u32,
+                                test_vec4_count
+                                    / vec4_per_thread
+                                    / TEST_WINDOW_1D_MAX_GROUPS as u32,
+                                1,
+                            );
+                            if let Some(pool) = query_pool {
+                                device.cmd_write_timestamp(
+                                    cmd_buf,
+                                    vk::PipelineStageFlagBits::BOTTOM_OF_PIPE,
+                                    pool,
+                                    1,
+                                );
+                            }
+                            device
+                                .end_command_buffer(cmd_buf)
+                                .err_retry_with_lower_memory(env, "end_command_buffer")?;
+                            device
+                                .queue_submit(queue, submit_info, fence)
+                                .err_retry_with_lower_memory(env, "queue_submit")?;
+                            device
+                                .wait_for_fences(&[fence], true, u64::MAX)
+                                .err_retry_with_lower_memory(env, "wait_for_fences")?;
+                            device
+                                .reset_fences(&[fence])
+                                .err_retry_with_lower_memory(env, "reset_fences")?;
+                            if let Some(pool) = query_pool {
+                                let mut stamps = [0u64; 2];
+                                device
+                                    .get_query_pool_results(
+                                        pool,
+                                        0,
+                                        2,
+                                        mem::size_of_val(&stamps),
+                                        stamps.as_mut_ptr().cast(),
+                                        mem::size_of::<u64>() as vk::DeviceSize,
+                                        vk::QueryResultFlags::_64 | vk::QueryResultFlags::WAIT,
+                                    )
+                                    .err_as_str_context("get_query_pool_results")?;
+                                let ticks = (stamps[1] & timestamp_mask)
+                                    .wrapping_sub(stamps[0] & timestamp_mask)
+                                    & timestamp_mask;
+                                return Ok(Some(ticks as f64 * timestamp_period_ns * 1e-9));
+                            }
+                            Ok(None)
+                        }
+                    };
+                unsafe { std::ptr::write(mapped, IOBuf::for_initial_iteration()) }
+                //try to do initial memory fill to verify that allocation is really usable
+                let mut overall_exec_result = Ok(());
+                'window: for window_idx in 0..test_window_count {
+                    for pipeline in [pipelines.write, pipelines.read] {
+                        if let Err(e) = execute_wait_queue(window_idx, pipeline, 1) {
+                            overall_exec_result = Err(e);
+                            break 'window;
                         }
                     }
+                }
+                match overall_exec_result {
+                    Err(e) => last_err = e,
+                    Ok(()) => break 'memsize,
                 }
             }
         }
@@ -983,7 +1478,7 @@ fn test_device<Writer: std::io::Write>(
     {
         match unsafe {
             device.map_memory(
-                test_memory.unwrap(),
+                test_memories[0],
                 0,
                 MAP_FOR_GETTING_ADDRESS_SIZE,
                 vk::MemoryMapFlags::default(),
@@ -998,7 +1493,7 @@ fn test_device<Writer: std::io::Write>(
             }
             Ok(virt_address) => {
                 let addr_details = ram::virt_addr_details(virt_address, physical_props.device_type);
-                unsafe { device.unmap_memory(test_memory.unwrap()) }; // After getting addresses the actual mapping is not needed anymore
+                unsafe { device.unmap_memory(test_memories[0]) }; // After getting addresses the actual mapping is not needed anymore
                 if let Some(details) = addr_details {
                     writeln!(
                         log_dupler,
@@ -1015,13 +1510,28 @@ fn test_device<Writer: std::io::Write>(
     if env.verbose() {
         let _ = writeln!(
             log_dupler,
-            "Test memory size {:5.1}GB   type {:2}: {:?} {:?} suitable 0b{:032b}",
-            allocation_size as f32 / GB,
+            "Test memory size {:5.1}GB in {} windows  type {:2}: {:?} {:?} suitable 0b{:032b}",
+            (test_window_size * test_window_count) as f32 / GB,
+            test_window_count,
             test_mem_index,
             test_memory_type,
             memory_props.memory_heaps[test_memory_type.heap_index as usize],
             test_mem_reqs.memory_type_bits
         );
+    }
+    if extended {
+        writeln!(
+            log_dupler,
+            "Extended mode: {} data-pattern families, March C- on one window per pass, retention window rotates every {}s (MEMTEST_VULKAN_MODE=classic for the original test)",
+            PATTERN_FAMILY_COUNT,
+            STATIC_WINDOW_ROTATE_PERIOD.as_secs()
+        )?;
+    }
+    if query_pool.is_none() {
+        writeln!(
+            log_dupler,
+            "GPU timestamps unavailable: speeds use CPU time and bandwidth-drop detection is off"
+        )?;
     }
 
     // allow write bugs emulation for testing purposes
@@ -1040,74 +1550,115 @@ fn test_device<Writer: std::io::Write>(
     let first_iter_start = time::Instant::now();
     let mut last_status_output = first_iter_start;
     let mut last_error_state = "          NO ERRORS       ".to_owned();
+    // The static window is written once and only re-read, which catches retention errors. It moves to
+    // the next window periodically so every window gets both rewrites and long dwell times.
+    let mut static_window = 0i64;
+    let mut static_buf = IOBuf::for_initial_iteration(); // what the initial fill left in window 0
+    let mut static_since = first_iter_start;
+    let mut march_window = 0i64;
+    let mut bandwidth = BandwidthTracker::default();
     for iteration in 1..=iter_count {
-        unsafe { std::ptr::write(mapped, buffer_in) }
+        let mut static_rewrite = false;
+        if static_since.elapsed() >= STATIC_WINDOW_ROTATE_PERIOD {
+            static_window = (static_window + 1) % test_window_count;
+            static_rewrite = true;
+            static_since = time::Instant::now();
+        }
         let write_start = time::Instant::now();
-        for window_idx in 1..test_window_count {
-            let test_offset = test_window_size * window_idx;
-            unsafe {
-                (*mapped).calc_param = buffer_in.calc_param + window_idx as u32 * 0x81_u32;
+        for window_idx in 0..test_window_count {
+            if window_idx == static_window && !static_rewrite {
+                continue;
             }
-            execute_wait_queue(
-                test_offset,
+            let window_buf = buffer_in.for_window(window_idx, extended);
+            if window_idx == static_window {
+                static_buf = window_buf;
+            }
+            unsafe { std::ptr::write(mapped, window_buf) }
+            let gpu_secs = execute_wait_queue(
+                window_idx,
                 if iteration != emulate_write_bugs_iteration {
                     pipelines.write
                 } else {
                     pipelines.emulate_write_bugs
                 },
+                1,
             )?;
+            written_bytes += test_window_size;
+            bandwidth.add(
+                KernelKind::Write,
+                window_buf.pattern,
+                test_window_size,
+                gpu_secs,
+            );
         }
-        written_bytes += test_window_size * (test_window_count - 1);
         write_duration += write_start.elapsed();
-        let mut last_buffer_out: IOBuf;
-        for window_idx in 0..test_window_count {
-            let reread_mode_for_this_win = window_idx == 0;
-            buffer_in.set_calc_param_for_starting_window();
-            buffer_in.calc_param += window_idx as u32 * 0x81_u32;
-            unsafe {
-                std::ptr::write(
-                    mapped,
-                    if reread_mode_for_this_win {
-                        IOBuf::for_initial_iteration()
-                    } else {
-                        buffer_in
-                    },
+        if extended {
+            // one non-static window per pass gets the March C- elements; the read pass below is the final r0
+            march_window = (march_window + 1) % test_window_count;
+            if march_window == static_window {
+                march_window = (march_window + 1) % test_window_count;
+            }
+            let window_buf = buffer_in.for_window(march_window, extended);
+            for (march_flags, mode) in MARCH_ELEMENTS {
+                let mut march_buf = window_buf;
+                march_buf.march_flags = march_flags;
+                unsafe { std::ptr::write(mapped, march_buf) }
+                let gpu_secs =
+                    execute_wait_queue(march_window, pipelines.march, MARCH_VEC4_PER_THREAD)?;
+                // each element reads and writes the whole window
+                bandwidth.add(
+                    KernelKind::March,
+                    march_buf.pattern,
+                    2 * test_window_size,
+                    gpu_secs,
                 );
+                let march_out = unsafe { std::ptr::read(mapped) };
+                report_window_errors(
+                    log_dupler,
+                    &march_out,
+                    test_window_size * march_window,
+                    test_window_size,
+                    mode,
+                    first_iter_start,
+                    &mut last_error_state,
+                )?;
             }
+        }
+        for window_idx in 0..test_window_count {
+            let reread_mode_for_this_win = window_idx == static_window && !static_rewrite;
+            let window_buf = if window_idx == static_window {
+                // a fresh iter only changes the read order; the expected data comes from calc_param+pattern
+                IOBuf {
+                    iter: buffer_in.iter,
+                    ..static_buf
+                }
+            } else {
+                buffer_in.for_window(window_idx, extended)
+            };
+            unsafe { std::ptr::write(mapped, window_buf) }
             let test_offset = test_window_size * window_idx;
-            execute_wait_queue(test_offset, pipelines.read)?;
-            {
-                unsafe {
-                    last_buffer_out = std::ptr::read(mapped);
-                }
-                if let Some((error_range, total_errors)) =
-                    last_buffer_out.get_error_addresses_and_count(test_offset)
-                {
-                    last_error_state =
-                        format!("LAST ERROR at {}", first_iter_start.elapsed().hhmmssxxx());
-                    close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
-                    let test_elems = test_window_size / ELEMENT_SIZE;
-                    write!(
-                        log_dupler,
-                        "Error found. Mode {}, total errors 0x{:X} out of 0x{:X} ({:2.8}%)\nErrors address range: {:?}",
-                        if reread_mode_for_this_win {
-                            "NEXT_RE_READ"
-                        } else {
-                            "INITIAL_READ"
-                        },
-                        total_errors,
-                        test_elems,
-                        total_errors as f64 / test_elems as f64 * 100.0f64,
-                        error_range,
-                    )?;
-                    writeln!(
-                        log_dupler,
-                        "  iteration:{}\n{}",
-                        last_buffer_out.iter, last_buffer_out
-                    )?;
-                }
-                last_buffer_out.check_vec_first()?;
-            }
+            let gpu_secs = execute_wait_queue(window_idx, pipelines.read, 1)?;
+            bandwidth.add(
+                KernelKind::Read,
+                window_buf.pattern,
+                test_window_size,
+                gpu_secs,
+            );
+            let last_buffer_out = unsafe { std::ptr::read(mapped) };
+            report_window_errors(
+                log_dupler,
+                &last_buffer_out,
+                test_offset,
+                test_window_size,
+                if reread_mode_for_this_win {
+                    "NEXT_RE_READ"
+                } else {
+                    "INITIAL_READ"
+                },
+                first_iter_start,
+                &mut last_error_state,
+            )?;
+            last_buffer_out.check_vec_first()?;
         }
         read_bytes += test_window_size * test_window_count;
         let moment_iter_ends = time::Instant::now();
@@ -1116,16 +1667,31 @@ fn test_device<Writer: std::io::Write>(
         if elapsed > next_report_duration || stop_testing {
             let write_secs = write_duration.as_secs_f32();
             let passed_secs = elapsed.as_secs_f32() - write_secs;
-            let write_speed_gbps = if write_secs > 0.0001 {
-                written_bytes as f32 / GB / write_secs
-            } else {
-                0f32
+            let (write_speed_gbps, check_speed_gbps) = match (
+                bandwidth.interval_gbps(KernelKind::Write),
+                bandwidth.interval_gbps(KernelKind::Read),
+            ) {
+                (Some(write_gbps), Some(read_gbps)) => (write_gbps as f32, read_gbps as f32),
+                _ => (
+                    if write_secs > 0.0001 {
+                        written_bytes as f32 / GB / write_secs
+                    } else {
+                        0f32
+                    },
+                    if passed_secs > 0.0001 {
+                        read_bytes as f32 / GB / passed_secs
+                    } else {
+                        0f32
+                    },
+                ),
             };
-            let check_speed_gbps = if passed_secs > 0.0001 {
-                read_bytes as f32 / GB / passed_secs
-            } else {
-                0f32
-            };
+            let march_speed = bandwidth
+                .interval_gbps(KernelKind::March)
+                .map(|gbps| format!("   march:{gbps:7.1}GB/s"))
+                .unwrap_or_default();
+            let full_length_interval =
+                next_report_duration == extended_test_report_duration && !stop_testing;
+            let bandwidth_warning = bandwidth.finish_interval(full_length_interval);
             let second1 = time::Duration::from_secs(1);
             if next_report_duration.is_zero() {
                 writeln!(log_dupler, "Standard 5-minute test of {}", selected_label)?;
@@ -1160,14 +1726,18 @@ fn test_device<Writer: std::io::Write>(
                 let formatted_time_hhmmss = (moment_iter_ends - first_iter_start).hhmmssxxx();
                 writeln!(
                     log_dupler,
-                    "{}    written:{:7.1}GB{:7.1}GB/s      checked:{:7.1}GB{:7.1}GB/s     {}",
+                    "{}    written:{:7.1}GB{:7.1}GB/s      checked:{:7.1}GB{:7.1}GB/s{}     {}",
                     last_error_state,
                     written_bytes as f32 / GB,
                     write_speed_gbps,
                     read_bytes as f32 / GB,
                     check_speed_gbps,
+                    march_speed,
                     formatted_time_hhmmss
                 )?;
+            }
+            if let Some(warning) = bandwidth_warning {
+                writeln!(log_dupler, "{warning}")?;
             }
             reports_before_standard_done -= 1;
             if reports_before_standard_done == 0 {
@@ -1190,8 +1760,11 @@ fn test_device<Writer: std::io::Write>(
     unsafe {
         device.device_wait_idle().err_as_str()?;
 
-        free_test_mem_and_buffers(device, &mut test_buffer, &mut test_memory);
+        free_test_mem_and_buffers(device, &mut test_buffers, &mut test_memories);
 
+        if let Some(pool) = query_pool {
+            device.destroy_query_pool(pool, None);
+        }
         device.destroy_buffer(io_buffer, None);
         device.unmap_memory(io_memory);
         device.free_memory(io_memory, None);
@@ -1210,6 +1783,8 @@ struct NamedComputeDevice {
     memory_props: vk::PhysicalDeviceMemoryProperties,
     budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
     index_in_device_iteration: usize,
+    max_memory_allocation_size: u64, // 0 when unknown (Vulkan 1.0)
+    timestamp_valid_bits: u32,
 }
 
 fn load_instance<Writer: std::io::Write>(
@@ -1408,12 +1983,15 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             {
                 return None;
             }
-            let queue_family = match instance
+            let (queue_family, timestamp_valid_bits) = match instance
                 .get_physical_device_queue_family_properties(physical_device, None)
                 .into_iter()
-                .position(|properties| properties.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .enumerate()
+                .find(|(_, properties)| properties.queue_flags.contains(vk::QueueFlags::COMPUTE))
             {
-                Some(queue_family) => queue_family as u32,
+                Some((queue_family, properties)) => {
+                    (queue_family as u32, properties.timestamp_valid_bits)
+                }
                 None => return None,
             };
 
@@ -1429,11 +2007,14 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             let mut budget_request =
                 ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXTBuilder::new();
 
+            let mut maintenance3_request = vk::PhysicalDeviceMaintenance3PropertiesBuilder::new();
+
             //older vulkan implementations like broadcom on RaspberryPi lacks vk_1_1 support even if application requested it
 
             let memory_props = if effective_version >= (1, 1) {
                 let mut device_props2 = vk::PhysicalDeviceProperties2Builder::new()
-                    .extend_from(&mut pci_structure_request);
+                    .extend_from(&mut pci_structure_request)
+                    .extend_from(&mut maintenance3_request);
 
                 instance.get_physical_device_properties2(physical_device, &mut device_props2);
                 properties = device_props2.properties;
@@ -1447,6 +2028,7 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             };
             let pci_props_structure = *pci_structure_request;
             let budget_props = *budget_request;
+            let max_memory_allocation_size = maintenance3_request.max_memory_allocation_size;
 
             Some((
                 physical_device,
@@ -1456,10 +2038,12 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
                 memory_props,
                 budget_props,
                 index_in_device_iteration,
+                max_memory_allocation_size,
+                timestamp_valid_bits,
             ))
         })
         .collect();
-    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _)| {
+    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _, _, _)| {
         // assuming that for multi-GPU scenarious the minimal PCIe bus number is used for picture output
         // and the maximal is the test target select by default "the descrete GPU with maximal PCIe bus number"
         match props.device_type {
@@ -1519,6 +2103,8 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             memory_props,
             budget_props: d.5,
             index_in_device_iteration: d.6,
+            max_memory_allocation_size: d.7,
+            timestamp_valid_bits: d.8,
         });
     }
     Ok(LoadedDevices::new(
@@ -2001,4 +2587,96 @@ fn main() {
     let result = list_devices_ordered_labaled_from_1(&env, &mut log_dupler)
         .and_then(|loaded_devices| init_vk_and_check_errors(loaded_devices, &env, &mut log_dupler));
     display_result(result, &env, &mut log_dupler);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prbs7_bits() -> Vec<u32> {
+        // x^7 + x^6 + 1, all-ones seed
+        let mut state = 0x7Fu32;
+        (0..127)
+            .map(|_| {
+                let out = state & 1;
+                let feedback = ((state >> 6) ^ (state >> 5)) & 1;
+                state = ((state << 1) | feedback) & 0x7F;
+                out
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prbs7_windows_match_lfsr() {
+        let bits = prbs7_bits();
+        for n in 0..127u32 {
+            let expected = (0..32).fold(0u32, |acc, j| acc | bits[((n + j) % 127) as usize] << j);
+            assert_eq!(prbs7_window(n), expected, "window at {n}");
+        }
+    }
+
+    #[test]
+    fn addr_rotate_matches_original_formula() {
+        for (e, p) in [
+            (0u32, 0u32),
+            (4, 0x100107),
+            (5, 0xFFFF_FFF0),
+            (123_456, 0x8708AB91),
+        ] {
+            let a = e.wrapping_add(p).wrapping_add(1);
+            assert_eq!(
+                pattern_u32(e, p, PATTERN_ADDR_ROTATE),
+                a.rotate_left(a % 31)
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_bytes_survive_dbi_dc() {
+        // DBI-DC inverts bytes with more than 4 zeros; toggle patterns must keep exactly 4
+        for variant in 0..15u32 {
+            for e in 0..64 {
+                let value = pattern_u32(e, 0, PATTERN_TOGGLE | (variant << 8));
+                for byte in value.to_le_bytes() {
+                    assert_eq!(
+                        byte.count_zeros(),
+                        4,
+                        "variant {variant} word {e}: {value:08X}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_iterations_change_every_window_pattern() {
+        for iter in 1..200u32 {
+            for window in 0..8u32 {
+                let now = pattern_for(iter, window, true);
+                let next = pattern_for(iter + 1, window, true);
+                assert_ne!(now & 0xFF, next & 0xFF);
+                assert_ne!(now & 0xFF, pattern_for(iter, window + 1, true) & 0xFF);
+            }
+        }
+        assert_eq!(pattern_for(7, 3, false), PATTERN_ADDR_ROTATE);
+    }
+
+    #[test]
+    fn all_ones_words_count_as_errors() {
+        let mut buf = IOBuf::for_initial_iteration();
+        buf.done_iter_or_err = 0xFFFF_FFFF;
+        buf.idx_min = 0;
+        buf.idx_max = 3;
+        buf.actual_ff = 4;
+        buf.mem_bitcount.0[17] = 1;
+        let (_, total) = buf.get_error_addresses_and_count(0).unwrap();
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn iobuf_layout_matches_wgsl() {
+        // WGSL aligns the trailing vec4<u32> to 16 bytes
+        assert_eq!(mem::offset_of!(IOBuf, first_elem), 432);
+        assert_eq!(mem::size_of::<IOBuf>(), 448);
+    }
 }
